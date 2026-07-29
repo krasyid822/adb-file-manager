@@ -1,0 +1,85 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'   # Trigger saat push tag seperti v1.0, v1.2.3
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: adb-file-manager-linux
+            exe_suffix: ""
+          - os: windows-latest
+            artifact_name: adb-file-manager-windows
+            exe_suffix: ".exe"
+          - os: macos-latest
+            artifact_name: adb-file-manager-macos
+            exe_suffix: ""
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Install tkinter (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Build executable
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --name "ADB File Manager"
+          "ADB File Manager.py"
+
+      - name: Rename output (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: mv "dist/ADB File Manager" "dist/${{ matrix.artifact_name }}"
+
+      - name: Rename output (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Rename-Item "dist\ADB File Manager.exe" "${{ matrix.artifact_name }}.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}${{ matrix.exe_suffix }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/adb-file-manager-linux/adb-file-manager-linux
+            dist/adb-file-manager-windows/adb-file-manager-windows.exe
+            dist/adb-file-manager-macos/adb-file-manager-macos
+          generate_release_notes: true
