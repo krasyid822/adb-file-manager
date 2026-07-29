@@ -1,5 +1,7 @@
 # ADB File Manager
 
+![Contoh tampilan](assets/.screenshots/image.png)
+
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 Aplikasi GUI untuk mengelola file di perangkat Android melalui ADB, tanpa perlu root.
