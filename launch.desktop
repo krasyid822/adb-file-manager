@@ -1,0 +1,13 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ADB File Manager
+Comment=Kelola file perangkat Android via ADB
+Exec=bash /home/rasyidk/vscode/adb-file-manager/launch.sh
+Path=/home/rasyidk/vscode/adb-file-manager
+Icon=phone
+Terminal=false
+Categories=Utility;FileManager;
+Keywords=adb;android;file;manager;
+StartupNotify=true
