@@ -1,878 +1,1570 @@
 import os
+import shutil
 import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
 import threading
 import time
-from pathlib import Path
 import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Callable, Tuple
 
-class ADBFileManagerGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("ADB File Manager GUI")
-        self.root.geometry("1200x700")
-        self.root.minsize(700, 450)
-        self.root.resizable(True, True)
+try:
+    import pty
+    HAS_PTY = True
+except ImportError:
+    HAS_PTY = False
 
-        # Variabel
-        self.device_id = None
-        self.current_path = "/storage/emulated/0"
-        self.items = []
-        self.raw_items = []
-        self.clipboard = None
-        self.clipboard_type = None
-        self.debug_mode = True
-        self.is_operating = False
+CHECKBOX_OFF = "☐"
+CHECKBOX_ON  = "☑"
 
-        # State Pengurutan (None = original, 'asc' = ascending, 'desc' = descending)
-        self.sort_state = {'column': None, 'dir': None}
 
-        # Warna tema
-        self.colors = {
-            'bg': '#2b2b2b',
-            'fg': '#ffffff',
-            'select': '#3a3a3a',
-            'accent': '#0078d4',
-            'success': '#4caf50',
-            'danger': '#f44336'
-        }
+def format_bytes(b: float) -> str:
+    """Format angka byte menjadi string human-readable (B, KB, MB, GB, TB)."""
+    if b <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}" if unit != "B" else f"{int(b)} B"
+        b /= 1024
+    return f"{b:.1f} PB"
 
-        self.setup_ui()
-        self.check_adb_and_devices()
 
-    def setup_ui(self):
-        """Setup tampilan GUI"""
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('Treeview',
-                       background='#2b2b2b',
-                       foreground='white',
-                       fieldbackground='#2b2b2b')
-        style.map('Treeview', background=[('selected', '#0078d4')])
+def format_speed(bps: float) -> str:
+    """Format kecepatan transfer bytes per detik menjadi string KB/s atau MB/s."""
+    if bps <= 0:
+        return "0 KB/s"
+    if bps < 1024:
+        return f"{bps:.0f} B/s"
+    elif bps < 1024 * 1024:
+        return f"{bps / 1024:.1f} KB/s"
+    else:
+        return f"{bps / (1024 * 1024):.2f} MB/s"
 
-        # Main container
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Top bar
-        top_frame = ttk.Frame(main_frame)
-        top_frame.pack(fill=tk.X, pady=5)
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                         DATA MODEL                                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 
-        ttk.Label(top_frame, text="Device:").pack(side=tk.LEFT, padx=5)
-        self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(top_frame, textvariable=self.device_var,
-                                        width=30, state='readonly')
-        self.device_combo.pack(side=tk.LEFT, padx=5)
-        self.device_combo.bind('<<ComboboxSelected>>', self.on_device_selected)
+@dataclass
+class FileItem:
+    name:       str
+    size_raw:   str
+    size_bytes: int
+    is_dir:     bool
+    is_link:    bool
+    modified:   str
+    file_type:  str     # 'DIR', 'LINK', 'MP4', 'TXT', '—', …
+    tree_id:    str = ""
 
-        ttk.Button(top_frame, text="🔄 Refresh Devices",
-                  command=self.refresh_devices).pack(side=tk.LEFT, padx=5)
-        ttk.Button(top_frame, text="📁 Connect",
-                  command=self.connect_device).pack(side=tk.LEFT, padx=5)
+    # ── Properties ────────────────────────────────────────────────────
 
-        self.status_label = ttk.Label(top_frame, text="Status: Disconnected",
-                                     foreground='red')
-        self.status_label.pack(side=tk.RIGHT, padx=10)
+    @property
+    def icon(self) -> str:
+        if self.is_link: return "🔗"
+        if self.is_dir:  return "📁"
+        return "📄"
 
-        # Path bar
-        path_frame = ttk.Frame(main_frame)
-        path_frame.pack(fill=tk.X, pady=5)
+    def human_size(self) -> str:
+        if self.is_dir:
+            return ""
+        b = self.size_bytes
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if b < 1024:
+                return f"{b:.0f} {unit}"
+            if unit != "TB":
+                b /= 1024
+        return f"{b:.1f} TB"
 
-        ttk.Label(path_frame, text="Path:").pack(side=tk.LEFT, padx=5)
-        self.path_var = tk.StringVar(value=self.current_path)
-        path_entry = ttk.Entry(path_frame, textvariable=self.path_var, width=70)
-        path_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(path_frame, text="Go", command=self.go_to_path).pack(side=tk.LEFT, padx=5)
-        ttk.Button(path_frame, text="⬆ Up", command=self.go_up).pack(side=tk.LEFT, padx=5)
-        ttk.Button(path_frame, text="🏠 Home", command=self.go_home).pack(side=tk.LEFT, padx=5)
+    # ── Factory helpers ────────────────────────────────────────────────
 
-        # Main content
-        content_frame = ttk.Frame(main_frame)
-        content_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+    @staticmethod
+    def _detect_type(name: str, is_dir: bool, is_link: bool) -> str:
+        if is_link: return "LINK"
+        if is_dir:  return "DIR"
+        ext = Path(name).suffix.lstrip(".")
+        return ext.upper() if ext else "—"
 
-        # File list
-        list_frame = ttk.Frame(content_frame)
-        list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    @classmethod
+    def from_ls_line(cls, name: str, size_raw: str,
+                     is_dir: bool, is_link: bool, modified: str) -> "FileItem":
+        try:
+            size_bytes = int(size_raw) if size_raw.isdigit() else 0
+        except Exception:
+            size_bytes = 0
+        return cls(name=name, size_raw=size_raw, size_bytes=size_bytes,
+                   is_dir=is_dir, is_link=is_link, modified=modified,
+                   file_type=cls._detect_type(name, is_dir, is_link))
 
-        tree_frame = ttk.Frame(list_frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
+    @classmethod
+    def from_direntry(cls, entry: os.DirEntry) -> "FileItem":
+        is_dir  = entry.is_dir(follow_symlinks=False)
+        is_link = entry.is_symlink()
+        try:
+            stat       = entry.stat(follow_symlinks=False)
+            size_bytes = stat.st_size
+            modified   = time.strftime("%Y-%m-%d %H:%M",
+                                       time.localtime(stat.st_mtime))
+        except OSError:
+            size_bytes = 0
+            modified   = ""
+        return cls(name=entry.name, size_raw=str(size_bytes),
+                   size_bytes=size_bytes, is_dir=is_dir, is_link=is_link,
+                   modified=modified,
+                   file_type=cls._detect_type(entry.name, is_dir, is_link))
 
-        self.tree = ttk.Treeview(tree_frame, columns=('Size', 'Modified'), show='tree headings')
-        
-        # Heading & event bind untuk sorting
-        self.tree.heading('#0', text='Name', command=lambda: self.toggle_sort('name'))
-        self.tree.heading('Size', text='Size', command=lambda: self.toggle_sort('size'))
-        self.tree.heading('Modified', text='Modified', command=lambda: self.toggle_sort('modified'))
-        
-        self.tree.column('#0', width=500)
-        self.tree.column('Size', width=150)
-        self.tree.column('Modified', width=200)
 
-        v_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        h_scroll = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                       BASE FILE PANEL                               ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        v_scroll.grid(row=0, column=1, sticky='ns')
-        h_scroll.grid(row=1, column=0, sticky='ew')
-        tree_frame.grid_rowconfigure(0, weight=1)
-        tree_frame.grid_columnconfigure(0, weight=1)
+class FilePanel(ttk.Frame):
+    """Reusable file-browser panel.  Subclasses implement refresh() and
+    the action toolbar/context-menu.  Provides:
+      • Treeview with sel / name / size / type / modified columns
+      • Click-able ☐/☑ checkboxes (col #1)
+      • Ctrl+Click / Shift+Click multi-select (native Treeview)
+      • 3-state column sorting (Asc → Desc → Default)
+      • Drag & drop support (wired by the App after instantiation)
+    """
 
-        self.tree.bind('<Double-1>', self.on_item_double_click)
-        self.tree.bind('<Button-3>', self.show_context_menu)
-        self.tree.bind('<<TreeviewSelect>>', self._on_selection_change)
+    def __init__(self, parent, panel_label: str,
+                 log_fn: Callable[[str], None], **kwargs):
+        super().__init__(parent, **kwargs)
+        self._log        = log_fn
+        self.panel_label = panel_label
+        self.current_path:  str            = ""
+        self.raw_items:     List[FileItem] = []
+        self.items:         List[FileItem] = []
+        self.sort_state                    = {"col": None, "dir": None}
+        self._checked_ids: set             = set()
+        # Drag state
+        self._drag_source_id: Optional[str]   = None
+        self._drag_start_xy:  Tuple[int, int]  = (0, 0)
+        self._drag_active:    bool             = False
+        # Set by App after construction
+        self._is_in_drop_target: Callable = lambda _: False
+        self._drag_target_cb:    Optional[Callable] = None
 
-        # Context menu state
-        self._context_menu_from_rightclick = False
+        self._build_panel()
 
-        # Right panel (Scrollable agar responsif di layar kecil)
-        action_frame = ttk.Frame(content_frame, width=220)
-        action_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+    # ── Panel scaffold ─────────────────────────────────────────────────
 
-        action_title = ttk.Label(action_frame, text="Actions", font=('Arial', 12, 'bold'))
-        action_title.pack(pady=5, anchor=tk.W)
+    def _build_panel(self):
+        # Header row
+        hdr = ttk.Frame(self)
+        hdr.pack(fill=tk.X, padx=2, pady=2)
+        ttk.Label(hdr, text=self.panel_label,
+                  font=("Arial", 11, "bold")).pack(side=tk.LEFT)
+        nav = ttk.Frame(hdr)
+        nav.pack(side=tk.RIGHT)
+        for txt, cmd in (("⬆", self.go_up), ("🏠", self.go_home),
+                         ("🔄", self.refresh)):
+            ttk.Button(nav, text=txt, width=3, command=cmd).pack(
+                side=tk.LEFT, padx=1)
 
-        # Canvas + Scrollbar untuk menampung tombol action
-        canvas = tk.Canvas(action_frame, width=200, bg='#2b2b2b', highlightthickness=0)
-        action_scrollbar = ttk.Scrollbar(action_frame, orient=tk.VERTICAL, command=canvas.yview)
-        scrollable_btn_frame = ttk.Frame(canvas)
+        # Path entry
+        self.path_var = tk.StringVar()
+        pe = ttk.Entry(self, textvariable=self.path_var)
+        pe.pack(fill=tk.X, padx=2, pady=2)
+        pe.bind("<Return>", lambda _: self.go_to_path(self.path_var.get()))
 
-        scrollable_btn_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # Subclass toolbar
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill=tk.X, padx=2, pady=1)
+        self._build_toolbar(toolbar)
 
-        canvas_window = canvas.create_window((0, 0), window=scrollable_btn_frame, anchor="nw")
-        
-        def _on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-        canvas.bind('<Configure>', _on_canvas_configure)
-        canvas.configure(yscrollcommand=action_scrollbar.set)
+        # Treeview container
+        tree_wrap = ttk.Frame(self)
+        tree_wrap.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self._build_treeview(tree_wrap)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        action_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Status bar & empty footer area (selalu dapat diklik untuk deselect & context menu walau file ribuan)
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill=tk.X, padx=4, pady=2)
 
-        buttons = [
-            ('📂 Open', self.open_selected),
-            ('📋 Copy', self.copy_selected),
-            ('✂️ Cut', self.cut_selected),
-            ('📌 Paste', self.paste_selected),
-            ('🗑 Delete', self.delete_selected),
-            ('🔄 Rename', self.rename_selected),
-            ('📁 New Folder', self.create_folder),
-            ('📤 Copy to PC', self.copy_to_pc),
-            ('📥 Copy from PC', self.copy_from_pc),
-            ('🔍 Search', self.search_files),
-            ('📊 Storage Info', self.show_storage_info),
-            ('🔄 Refresh', self.refresh_current),
-            ('🐛 Debug Info', self.show_debug_info)
-        ]
+        self.status_var = tk.StringVar(value="0 items")
+        self.status_lbl = ttk.Label(status_frame, textvariable=self.status_var,
+                                    font=("Arial", 8), foreground="gray", cursor="hand2")
+        self.status_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        for text, command in buttons:
-            btn = ttk.Button(scrollable_btn_frame, text=text, command=command)
-            btn.pack(fill=tk.X, pady=2, padx=2)
+        # Klik pada status bar / footer berfungsi sebagai klik area kosong permanen
+        self.status_lbl.bind("<Button-1>", lambda _: self._on_empty_area_click())
+        self.status_lbl.bind("<Button-3>", self._on_right_click)
+        status_frame.bind("<Button-1>", lambda _: self._on_empty_area_click())
+        status_frame.bind("<Button-3>", self._on_right_click)
 
-        # Progress indicator panel (tetap terlihat di bagian kanan bawah atau log)
-        self.progress_frame = ttk.Frame(action_frame)
-        self.progress_frame.pack(fill=tk.X, pady=5)
+    def _on_empty_area_click(self):
+        """Deselect item fokus saat area kosong/status bar diklik."""
+        self.tree.selection_remove(self.tree.selection())
 
-        self.progress_status_label = ttk.Label(self.progress_frame, text="", font=('Arial', 9))
-        self.progress_status_label.pack(fill=tk.X, pady=1)
+    def _build_toolbar(self, parent: ttk.Frame):
+        """Override in subclass."""
 
-        self.progress_var = tk.DoubleVar()
-        self.progress = ttk.Progressbar(self.progress_frame, variable=self.progress_var,
-                                       maximum=100, length=180)
-        self.progress.pack(fill=tk.X, pady=2)
-        self.progress.pack_forget()
-        self.progress_status_label.pack_forget()
+    def _build_treeview(self, parent: ttk.Frame):
+        cols = ("sel", "name", "size", "type", "modified")
+        self.tree = ttk.Treeview(parent, columns=cols,
+                                 show="headings", selectmode="extended")
 
-        # Log
-        log_frame = ttk.Frame(main_frame)
-        log_frame.pack(fill=tk.X, pady=5)
+        # Visual highlight tags:
+        # 'checked' = item yang dicentang checkbox (Biru Terang tegas terpilih)
+        # 'normal'  = item biasa yang tidak dicentang
+        self.tree.tag_configure("checked", background="#0078d4", foreground="#ffffff")
+        self.tree.tag_configure("normal",  background="#2b2b2b", foreground="#e8e8e8")
 
-        ttk.Label(log_frame, text="Log:").pack(anchor=tk.W)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=5,
-                                                 bg='#1e1e1e', fg='#00ff00',
-                                                 font=('Consolas', 9))
-        self.log_text.pack(fill=tk.X)
+        self.tree.heading("sel",      text="☐",
+                          command=self._toggle_all_checkboxes)
+        self.tree.heading("name",     text="Name",
+                          command=lambda: self.toggle_sort("name"))
+        self.tree.heading("size",     text="Size",
+                          command=lambda: self.toggle_sort("size"))
+        self.tree.heading("type",     text="Type",
+                          command=lambda: self.toggle_sort("type"))
+        self.tree.heading("modified", text="Modified",
+                          command=lambda: self.toggle_sort("modified"))
+
+        self.tree.column("sel",      width=32,  minwidth=32,
+                         anchor="center", stretch=False)
+        self.tree.column("name",     width=260, minwidth=120)
+        self.tree.column("size",     width=78,  minwidth=55,
+                         anchor="e",      stretch=False)
+        self.tree.column("type",     width=58,  minwidth=40,
+                         anchor="center", stretch=False)
+        self.tree.column("modified", width=132, minwidth=90)
+
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL,   command=self.tree.yview)
+        hsb = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Events
+        self.tree.bind("<Button-1>",        self._on_button_press)
+        self.tree.bind("<B1-Motion>",        self._on_drag_motion)
+        self.tree.bind("<ButtonRelease-1>",  self._on_button_release)
+        self.tree.bind("<Double-1>",         self._on_double_click)
+        self.tree.bind("<Button-3>",         self._on_right_click)
 
         # Context menu
-        self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Open", command=self.open_selected)
-        self.context_menu.add_command(label="Copy", command=self.copy_selected)
-        self.context_menu.add_command(label="Cut", command=self.cut_selected)
-        self.context_menu.add_command(label="Paste", command=self.paste_selected)
-        self.context_menu.add_command(label="Delete", command=self.delete_selected)
-        self.context_menu.add_command(label="Rename", command=self.rename_selected)
-        self.context_menu.add_command(label="Copy to PC", command=self.copy_to_pc)
+        self._ctx = tk.Menu(self.tree, tearoff=0)
+        self._build_context_menu(self._ctx)
 
-        self.root.bind('<Control-c>', lambda e: self.copy_selected())
-        self.root.bind('<Control-v>', lambda e: self.paste_selected())
-        self.root.bind('<Delete>', lambda e: self.delete_selected())
-        self.root.bind('<F5>', lambda e: self.refresh_current())
+        # Keyboard shortcuts
+        self.tree.bind("<Control-c>", lambda _: self._copy_selected())
+        self.tree.bind("<Control-x>", lambda _: self._cut_selected())
+        self.tree.bind("<Control-v>", lambda _: self._paste_selected())
+        self.tree.bind("<Control-a>", lambda _: (self.select_all(), "break"))
+        self.tree.bind("<Escape>",    lambda _: (self.deselect_all(), self._on_empty_area_click()))
+        self.tree.bind("<Delete>",    lambda _: self._delete_selected())
 
-    def check_adb_and_devices(self):
+        # Bind area kosong di wrapper frame
+        parent.bind("<Button-1>", lambda _: self._on_empty_area_click())
+        parent.bind("<Button-3>", self._on_right_click)
+
+    def _build_context_menu(self, menu: tk.Menu):
+        """Override in subclass."""
+
+    # ── Clipboard Hooks ───────────────────────────────────────────────
+
+    def _copy_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        if hasattr(self, "_on_copy_cb") and self._on_copy_cb:
+            self._on_copy_cb(self, self.current_path, checked)
+
+    def _cut_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        if hasattr(self, "_on_cut_cb") and self._on_cut_cb:
+            self._on_cut_cb(self, self.current_path, checked)
+
+    def _paste_selected(self):
+        if hasattr(self, "_on_paste_cb") and self._on_paste_cb:
+            self._on_paste_cb(self, self.current_path)
+
+    def _delete_selected(self):
+        """Override in subclass."""
+
+    # ── Checkbox & Highlight ──────────────────────────────────────────
+
+    def _on_button_press(self, event):
+        col     = self.tree.identify_column(event.x)
+        item_id = self.tree.identify_row(event.y)
+
+        # Klik di area kosong (di bawah item) -> bersihkan seleksi
+        if not item_id:
+            self.tree.selection_remove(self.tree.selection())
+            self._drag_source_id = None
+            self._drag_active    = False
+            return
+
+        # Prepare drag state
+        self._drag_source_id = item_id
+        self._drag_start_xy  = (event.x_root, event.y_root)
+        self._drag_active    = False
+
+        # Checkbox column → toggle and stop
+        if col == "#1":
+            self._toggle_checkbox(item_id)
+            self._drag_source_id = None
+            return "break"
+
+    def _toggle_checkbox(self, item_id: str):
+        if item_id in self._checked_ids:
+            self._checked_ids.discard(item_id)
+            cb = CHECKBOX_OFF
+            tag = "normal"
+        else:
+            self._checked_ids.add(item_id)
+            cb = CHECKBOX_ON
+            tag = "checked"
+        vals = list(self.tree.item(item_id, "values"))
+        if vals:
+            vals[0] = cb
+            self.tree.item(item_id, values=vals, tags=(tag,))
+        self._update_status_bar()
+
+    def _toggle_all_checkboxes(self):
+        children = self.tree.get_children()
+        if children and all(c in self._checked_ids for c in children):
+            self.deselect_all()
+        else:
+            self.select_all()
+
+    def select_all(self):
+        for iid in self.tree.get_children():
+            self._checked_ids.add(iid)
+            vals = list(self.tree.item(iid, "values"))
+            if vals:
+                vals[0] = CHECKBOX_ON
+                self.tree.item(iid, values=vals, tags=("checked",))
+        self._update_status_bar()
+
+    def deselect_all(self):
+        for iid in list(self._checked_ids):
+            vals = list(self.tree.item(iid, "values"))
+            if vals:
+                vals[0] = CHECKBOX_OFF
+                self.tree.item(iid, values=vals, tags=("normal",))
+        self._checked_ids.clear()
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        n = len(self.items)
+        n_chk = len(self._checked_ids)
+        if n_chk > 0:
+            self.status_var.set(f"📊 {n} item{'s' if n != 1 else ''}  ({n_chk} selected) • [Esc / Klik bar ini untuk unselect]")
+        else:
+            self.status_var.set(f"📁 {n} item{'s' if n != 1 else ''}")
+
+    def get_checked_items(self) -> List[FileItem]:
+        result = [fi for fi in self.items if fi.tree_id in self._checked_ids]
+        if not result:
+            # Fallback: highlighted Treeview selection
+            sel = set(self.tree.selection())
+            result = [fi for fi in self.items if fi.tree_id in sel]
+        return result
+
+    # ── Drag & Drop ───────────────────────────────────────────────────
+
+    def _on_drag_motion(self, event):
+        if not self._drag_source_id:
+            return
+        dx = abs(event.x_root - self._drag_start_xy[0])
+        dy = abs(event.y_root - self._drag_start_xy[1])
+        if (dx > 5 or dy > 5) and not self._drag_active:
+            self._drag_active = True
+            self.tree.config(cursor="fleur")
+
+    def _on_button_release(self, event):
+        self.tree.config(cursor="")
+        if self._drag_active and self._drag_source_id:
+            target = self.winfo_toplevel().winfo_containing(
+                event.x_root, event.y_root)
+            if target and self._is_in_drop_target(target):
+                # Auto-check dragged item if not already
+                if self._drag_source_id not in self._checked_ids:
+                    self._toggle_checkbox(self._drag_source_id)
+                if self._drag_target_cb:
+                    self._drag_target_cb()
+        self._drag_source_id = None
+        self._drag_active    = False
+
+    # ── Sorting ───────────────────────────────────────────────────────
+
+    def toggle_sort(self, col: str):
+        s = self.sort_state
+        if s["col"] != col:
+            s["col"], s["dir"] = col, "asc"
+        elif s["dir"] == "asc":
+            s["dir"] = "desc"
+        else:
+            s["col"], s["dir"] = None, None
+        self._apply_sort_and_render()
+
+    def _apply_sort_and_render(self):
+        col, direction = self.sort_state["col"], self.sort_state["dir"]
+
+        if not col:
+            self.items = list(self.raw_items)
+        else:
+            rev = (direction == "desc")
+            key_map = {
+                "name":     lambda x: x.name.lower(),
+                "size":     lambda x: x.size_bytes,
+                "type":     lambda x: (0 if x.is_dir else 1, x.file_type.lower()),
+                "modified": lambda x: x.modified,
+            }
+            key = key_map.get(col, key_map["name"])
+            dirs  = sorted([x for x in self.raw_items if x.is_dir],      key=key, reverse=rev)
+            files = sorted([x for x in self.raw_items if not x.is_dir],  key=key, reverse=rev)
+            self.items = dirs + files
+
+        self._render_items()
+        self._refresh_headers()
+
+    def _refresh_headers(self):
+        col, dir_ = self.sort_state["col"], self.sort_state["dir"]
+        arrow = {"asc": " ▲", "desc": " ▼"}.get(dir_, "")
+        mapping = {"name": "Name", "size": "Size",
+                   "type": "Type", "modified": "Modified"}
+        for c, base in mapping.items():
+            self.tree.heading(c, text=base + (arrow if col == c else ""))
+
+    def _render_items(self):
+        # Preserve checked state by name
+        prev_checked = {fi.name for fi in self.items if fi.tree_id in self._checked_ids}
+        self._checked_ids.clear()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+
+        for fi in self.items:
+            is_chk = fi.name in prev_checked
+            cb = CHECKBOX_ON if is_chk else CHECKBOX_OFF
+            tag = "checked" if is_chk else "normal"
+            iid = self.tree.insert("", "end", values=(
+                cb,
+                f"{fi.icon}  {fi.name}",
+                fi.human_size(),
+                fi.file_type,
+                fi.modified,
+            ), tags=(tag,))
+            fi.tree_id = iid
+            if is_chk:
+                self._checked_ids.add(iid)
+
+        self._update_status_bar()
+
+    # ── Navigation ────────────────────────────────────────────────────
+
+    def go_to_path(self, path: str):
+        path = path.strip()
+        if path:
+            self.current_path = path
+            self.refresh()
+
+    def go_up(self):
+        parent = os.path.dirname(self.current_path.rstrip("/\\"))
+        if parent and parent != self.current_path:
+            self.go_to_path(parent)
+
+    def go_home(self):
+        self.go_to_path(self._home_path())
+
+    def _home_path(self) -> str:
+        return "/"
+
+    def refresh(self):
+        """Override in subclass."""
+
+    # ── Events ────────────────────────────────────────────────────────
+
+    def _on_double_click(self, event):
+        col     = self.tree.identify_column(event.x)
+        item_id = self.tree.identify_row(event.y)
+        if col == "#1" or not item_id:
+            return
+        fi = self._item_by_id(item_id)
+        if fi and fi.is_dir:
+            self.go_to_path(os.path.join(self.current_path, fi.name))
+
+    def _on_right_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            if item_id not in self.tree.selection():
+                self.tree.selection_set(item_id)
+        else:
+            self.tree.selection_remove(self.tree.selection())
+
         try:
-            subprocess.run(['adb', 'version'], capture_output=True, check=True)
-            self.log("✅ ADB terdeteksi")
-            self.refresh_devices()
-        except Exception as e:
-            messagebox.showerror("Error", f"ADB tidak ditemukan!\n{str(e)}")
-            self.status_label.config(text="Status: ADB Error", foreground='red')
+            self._ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx.grab_release()
 
-    def refresh_devices(self):
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _item_by_id(self, tree_id: str) -> Optional[FileItem]:
+        return next((fi for fi in self.items if fi.tree_id == tree_id), None)
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                       ANDROID PANEL                                 ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+class AndroidPanel(FilePanel):
+
+    def __init__(self, parent,
+                 device_id_fn:    Callable[[], Optional[str]],
+                 run_adb_fn:      Callable,
+                 set_progress_fn: Callable,
+                 log_fn:          Callable, **kwargs):
+        self._get_device_id = device_id_fn
+        self._run_adb       = run_adb_fn
+        self._set_progress  = set_progress_fn
+        super().__init__(parent, "📱  Android", log_fn, **kwargs)
+        self.current_path = "/storage/emulated/0"
+        self.path_var.set(self.current_path)
+
+    def _home_path(self): return "/storage/emulated/0"
+
+    # ── Toolbar ───────────────────────────────────────────────────────
+
+    def _build_toolbar(self, parent):
+        for txt, cmd in (
+            ("📂 Open",   self._open_selected),
+            ("📁 New",    self._new_folder),
+            ("📋 Copy",   self._copy_selected),
+            ("✂️ Cut",    self._cut_selected),
+            ("📌 Paste",  self._paste_selected),
+            ("✏️ Rename", self._rename_selected),
+            ("🗑 Delete",  self._delete_selected),
+            ("☑ All",     self.select_all),
+            ("☐ None",    self.deselect_all),
+        ):
+            ttk.Button(parent, text=txt, command=cmd,
+                       width=8).pack(side=tk.LEFT, padx=1, pady=1)
+
+    def _build_context_menu(self, m):
+        m.add_command(label="Open",          command=self._open_selected)
+        m.add_command(label="New Folder",    command=self._new_folder)
+        m.add_separator()
+        m.add_command(label="Copy", command=self._copy_selected)
+        m.add_command(label="Cut",  command=self._cut_selected)
+        m.add_command(label="Paste",command=self._paste_selected)
+        m.add_separator()
+        m.add_command(label="Rename",        command=self._rename_selected)
+        m.add_command(label="Delete",        command=self._delete_selected)
+
+    # ── Refresh ───────────────────────────────────────────────────────
+
+    def refresh(self):
+        if not self._get_device_id():
+            self._log("⚠️ No device connected")
+            return
+
+        def worker():
+            try:
+                base_dir = self.current_path.rstrip('/') or '/'
+                result = self._run_adb(["shell", f'ls -la "{base_dir}"'])
+                if result.returncode != 0:
+                    result = self._run_adb(["shell", "ls", "-la", base_dir])
+                if result.returncode != 0:
+                    result = self._run_adb(["shell", f'ls "{base_dir}"'])
+                    if result.returncode != 0:
+                        self._log(f"❌ Cannot read: {result.stderr[:80]}")
+                        return
+                    names = [n.strip() for n in result.stdout.splitlines()
+                             if n.strip() not in ("", ".", "..")]
+                    raw = [FileItem.from_ls_line(n, "0", False, False, "")
+                           for n in names]
+                else:
+                    raw = self._parse_ls(result.stdout)
+
+                self.raw_items = raw
+                self.winfo_toplevel().after(
+                    0, lambda: self.path_var.set(self.current_path))
+                self.winfo_toplevel().after(0, self._apply_sort_and_render)
+                self._log(f"📂 {len(raw)} items — {self.current_path}")
+            except Exception as exc:
+                self._log(f"❌ Android refresh: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _parse_ls(output: str) -> List[FileItem]:
+        items = []
+        # ISO timestamp pattern: [perms] [links] [owner] [group] <size> YYYY-MM-DD HH:MM <name>
+        iso_re = re.compile(
+            r'^([bcdlsp-][rwxstST-]{9})\s+.*?\s+(\d+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(.+)$'
+        )
+        # Unix timestamp pattern: [perms] [links] [owner] [group] <size> Mon DD HH:MM/YYYY <name>
+        trad_re = re.compile(
+            r'^([bcdlsp-][rwxstST-]{9})\s+.*?\s+(\d+)\s+([A-Za-z]{3}\s+\d+\s+(?:\d{2}:\d{2}|\d{4}))\s+(.+)$'
+        )
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.startswith("total"):
+                continue
+
+            m = iso_re.match(line)
+            if not m:
+                m = trad_re.match(line)
+
+            if m:
+                perm, size_raw, modified, name = m.group(1), m.group(2), m.group(3), m.group(4)
+                name = name.strip()
+                if name in (".", ".."):
+                    continue
+                is_dir  = perm.startswith("d")
+                is_link = perm.startswith("l")
+                if is_link and " -> " in name:
+                    name = name.split(" -> ")[0].strip()
+                items.append(FileItem.from_ls_line(
+                    name, size_raw, is_dir, is_link, modified))
+            else:
+                parts = line.split()
+                if len(parts) >= 8 and len(parts[0]) >= 10:
+                    perm = parts[0]
+                    size_raw = "0"
+                    for i in range(len(parts)-3, 0, -1):
+                        if parts[i].isdigit():
+                            size_raw = parts[i]
+                            name = " ".join(parts[i+3:]) if i+3 < len(parts) else parts[-1]
+                            modified = f"{parts[i+1]} {parts[i+2]}" if i+2 < len(parts) else ""
+                            break
+                    else:
+                        name = parts[-1]
+                        modified = ""
+                    if name not in (".", ".."):
+                        is_dir = perm.startswith("d")
+                        is_link = perm.startswith("l")
+                        if is_link and " -> " in name:
+                            name = name.split(" -> ")[0].strip()
+                        items.append(FileItem.from_ls_line(
+                            name, size_raw, is_dir, is_link, modified))
+        return items
+
+    # ── Actions ───────────────────────────────────────────────────────
+
+    def _open_selected(self):
+        sel = self.tree.selection()
+        if sel:
+            fi = self._item_by_id(sel[0])
+            if fi and fi.is_dir:
+                self.go_to_path(f"{self.current_path.rstrip('/')}/{fi.name}")
+
+    def _new_folder(self):
+        name = simpledialog.askstring("New Folder", "Folder name:", parent=self)
+        if not name:
+            return
+
+        def w():
+            base_dir = self.current_path.rstrip('/')
+            target_p = f"{base_dir}/{name}"
+            r = self._run_adb(["shell", f'mkdir -p "{target_p}"'])
+            if r.returncode != 0:
+                r = self._run_adb(["shell", "mkdir", "-p", target_p])
+            if r.returncode == 0:
+                self._log(f"📁 Created: {name}")
+                self.winfo_toplevel().after(0, self.refresh)
+            else:
+                self._log(f"❌ mkdir: {r.stderr}")
+        threading.Thread(target=w, daemon=True).start()
+
+    def _rename_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        fi = checked[0]
+        new = simpledialog.askstring("Rename", f"Rename '{fi.name}':",
+                                     initialvalue=fi.name, parent=self)
+        if not new or new == fi.name:
+            return
+
+        def w():
+            base_dir = self.current_path.rstrip('/')
+            old_p = f"{base_dir}/{fi.name}"
+            new_p = f"{base_dir}/{new}"
+            r = self._run_adb(["shell", f'mv "{old_p}" "{new_p}"'])
+            if r.returncode != 0:
+                r = self._run_adb(["shell", "mv", old_p, new_p])
+            self._log(f"✏️ Renamed: {fi.name} → {new}" if r.returncode == 0
+                      else f"❌ Rename: {r.stderr}")
+            if r.returncode == 0:
+                self.winfo_toplevel().after(0, self.refresh)
+        threading.Thread(target=w, daemon=True).start()
+
+    def _delete_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        preview = ", ".join(fi.name for fi in checked[:3])
+        if len(checked) > 3:
+            preview += f" (+{len(checked)-3} more)"
+        if not messagebox.askyesno("Confirm Delete",
+                                   f"Hapus {len(checked)} item(s)?\n{preview}",
+                                   parent=self):
+            return
+        self._set_progress(True, status="Deleting…", mode="indeterminate")
+
+        def w():
+            try:
+                base_dir = self.current_path.rstrip('/')
+                for fi in checked:
+                    target_p = f"{base_dir}/{fi.name}"
+                    r = self._run_adb(["shell", f'rm -rf "{target_p}"'])
+                    if r.returncode != 0:
+                        r = self._run_adb(["shell", "rm", "-rf", target_p])
+                    self._log(f"🗑 Deleted: {fi.name}" if r.returncode == 0
+                              else f"❌ Delete {fi.name}: {r.stderr}")
+                self.deselect_all()
+                self.winfo_toplevel().after(0, self.refresh)
+            finally:
+                self._set_progress(False)
+        threading.Thread(target=w, daemon=True).start()
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                         PC PANEL                                    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+class PCPanel(FilePanel):
+
+    def __init__(self, parent,
+                 set_progress_fn: Callable,
+                 log_fn:          Callable, **kwargs):
+        self._set_progress = set_progress_fn
+        super().__init__(parent, "💻  PC", log_fn, **kwargs)
+        self.current_path = str(Path.home())
+        self.path_var.set(self.current_path)
+
+    def _home_path(self): return str(Path.home())
+
+    # ── Toolbar ───────────────────────────────────────────────────────
+
+    def _build_toolbar(self, parent):
+        for txt, cmd in (
+            ("📂 Open",   self._open_selected),
+            ("📁 New",    self._new_folder),
+            ("📋 Copy",   self._copy_selected),
+            ("✂️ Cut",    self._cut_selected),
+            ("📌 Paste",  self._paste_selected),
+            ("✏️ Rename", self._rename_selected),
+            ("🗑 Delete",  self._delete_selected),
+            ("☑ All",     self.select_all),
+            ("☐ None",    self.deselect_all),
+        ):
+            ttk.Button(parent, text=txt, command=cmd,
+                       width=8).pack(side=tk.LEFT, padx=1, pady=1)
+
+    def _build_context_menu(self, m):
+        m.add_command(label="Open",          command=self._open_selected)
+        m.add_command(label="New Folder",    command=self._new_folder)
+        m.add_separator()
+        m.add_command(label="Copy", command=self._copy_selected)
+        m.add_command(label="Cut",  command=self._cut_selected)
+        m.add_command(label="Paste",command=self._paste_selected)
+        m.add_separator()
+        m.add_command(label="Rename",        command=self._rename_selected)
+        m.add_command(label="Delete",        command=self._delete_selected)
+
+    # ── Refresh ───────────────────────────────────────────────────────
+
+    def refresh(self):
+        def worker():
+            try:
+                entries = list(os.scandir(self.current_path))
+                raw = []
+                for e in entries:
+                    if e.name.startswith("."):
+                        continue
+                    try:
+                        raw.append(FileItem.from_direntry(e))
+                    except Exception:
+                        pass
+                self.raw_items = raw
+                self.winfo_toplevel().after(
+                    0, lambda: self.path_var.set(self.current_path))
+                self.winfo_toplevel().after(0, self._apply_sort_and_render)
+                self._log(f"💻 {len(raw)} items — {self.current_path}")
+            except PermissionError:
+                self._log(f"❌ Permission denied: {self.current_path}")
+            except Exception as exc:
+                self._log(f"❌ PC refresh: {exc}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Actions ───────────────────────────────────────────────────────
+
+    def _open_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        fi = self._item_by_id(sel[0])
+        if not fi:
+            return
+        full = os.path.join(self.current_path, fi.name)
+        if fi.is_dir:
+            self.go_to_path(full)
+        else:
+            try:
+                subprocess.Popen(["xdg-open", full])
+            except Exception:
+                pass
+
+    def _new_folder(self):
+        name = simpledialog.askstring("New Folder", "Folder name:", parent=self)
+        if not name:
+            return
         try:
-            result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
-            devices = result.stdout.strip().split('\n')[1:]
-            devices = [d.split('\t')[0] for d in devices if d.strip() and 'device' in d]
+            os.makedirs(os.path.join(self.current_path, name), exist_ok=True)
+            self._log(f"📁 Created: {name}")
+            self.winfo_toplevel().after(0, self.refresh)
+        except Exception as exc:
+            self._log(f"❌ mkdir: {exc}")
 
-            self.device_combo['values'] = devices
+    def _rename_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        fi = checked[0]
+        new = simpledialog.askstring("Rename", f"Rename '{fi.name}':",
+                                     initialvalue=fi.name, parent=self)
+        if not new or new == fi.name:
+            return
+        try:
+            os.rename(os.path.join(self.current_path, fi.name),
+                      os.path.join(self.current_path, new))
+            self._log(f"✏️ Renamed: {fi.name} → {new}")
+            self.winfo_toplevel().after(0, self.refresh)
+        except Exception as exc:
+            self._log(f"❌ Rename: {exc}")
+
+    def _delete_selected(self):
+        checked = self.get_checked_items()
+        if not checked:
+            messagebox.showwarning("Warning", "Pilih item dulu!", parent=self)
+            return
+        if not messagebox.askyesno("Confirm Delete",
+                                   f"Hapus {len(checked)} item(s)?",
+                                   parent=self):
+            return
+        for fi in checked:
+            path = os.path.join(self.current_path, fi.name)
+            try:
+                shutil.rmtree(path) if fi.is_dir else os.remove(path)
+                self._log(f"🗑 Deleted: {fi.name}")
+            except Exception as exc:
+                self._log(f"❌ Delete {fi.name}: {exc}")
+        self.winfo_toplevel().after(0, self.refresh)
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                     MAIN APPLICATION                                ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+class ADBFileManagerApp:
+    """Orchestrates AndroidPanel + PCPanel, ADB connectivity, and transfers."""
+
+    def __init__(self, root: tk.Tk):
+        self.root          = root
+        self.device_id:    Optional[str] = None
+        self.is_operating: bool          = False
+        self._current_transfer_proc: Optional[subprocess.Popen] = None
+        self._cancel_requested: bool = False
+
+        # Clipboard State (Copy / Cut / Paste)
+        self._clipboard_items: List[FileItem] = []
+        self._clipboard_action: Optional[str] = None  # "copy" | "cut"
+        self._clipboard_source_panel: Optional[FilePanel] = None
+        self._clipboard_source_dir: str = ""
+
+        root.title("ADB File Manager")
+        root.geometry("1440x780")
+        root.minsize(920, 520)
+        root.resizable(True, True)
+
+        self._setup_style()
+        self._build_ui()
+        self._check_adb()
+
+    # ── Style ─────────────────────────────────────────────────────────
+
+    def _setup_style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        BG, FG = "#2b2b2b", "#e8e8e8"
+        ACCENT = "#0078d4"       # Biru aksen tombol transfer & checked
+        CLICK_FOCUS = "#404850"  # Abu-abu slate untuk baris yang HANYA diklik
+
+        s.configure("Treeview",
+                    background=BG, foreground=FG,
+                    fieldbackground=BG, rowheight=22)
+        s.map("Treeview",
+              background=[("selected", CLICK_FOCUS)],
+              foreground=[("selected", "#ffffff")])
+        s.configure("TFrame",  background=BG)
+        s.configure("TLabel",  background=BG, foreground=FG)
+        s.configure("TEntry",  fieldbackground="#3c3c3c", foreground=FG)
+        s.configure("TButton", padding=3)
+        s.configure("Transfer.TButton",
+                    background=ACCENT, foreground="#ffffff", padding=(8, 4))
+        s.configure("Cancel.TButton",
+                    background="#d32f2f", foreground="#ffffff", padding=(6, 2))
+
+    # ── Build UI ──────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        self._build_device_bar(main)
+
+        paned = ttk.PanedWindow(main, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self.android = AndroidPanel(
+            paned,
+            device_id_fn=lambda: self.device_id,
+            run_adb_fn=self._run_adb,
+            set_progress_fn=self._set_progress,
+            log_fn=self._log,
+        )
+        self.pc = PCPanel(
+            paned,
+            set_progress_fn=self._set_progress,
+            log_fn=self._log,
+        )
+        paned.add(self.android, weight=1)
+        paned.add(self.pc,      weight=1)
+
+        # Wire clipboard
+        self.android._on_copy_cb  = self._clipboard_copy
+        self.android._on_cut_cb   = self._clipboard_cut
+        self.android._on_paste_cb = self._clipboard_paste
+
+        self.pc._on_copy_cb  = self._clipboard_copy
+        self.pc._on_cut_cb   = self._clipboard_cut
+        self.pc._on_paste_cb = self._clipboard_paste
+
+        # Wire drag & drop
+        self.android._is_in_drop_target = \
+            lambda w: self._child_of(w, self.pc)
+        self.pc._is_in_drop_target = \
+            lambda w: self._child_of(w, self.android)
+        self.android._drag_target_cb = self._transfer_android_to_pc
+        self.pc._drag_target_cb      = self._transfer_pc_to_android
+
+        self._build_transfer_bar(main)
+        self._build_log(main)
+
+    def _build_device_bar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, pady=2)
+        ttk.Label(bar, text="Device:").pack(side=tk.LEFT, padx=4)
+        self.device_var   = tk.StringVar()
+        self.device_combo = ttk.Combobox(bar, textvariable=self.device_var,
+                                         width=26, state="readonly")
+        self.device_combo.pack(side=tk.LEFT, padx=3)
+        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
+        ttk.Button(bar, text="🔄 Refresh",
+                   command=self._refresh_devices).pack(side=tk.LEFT, padx=3)
+        ttk.Button(bar, text="🔌 Connect",
+                   command=self._connect_device).pack(side=tk.LEFT, padx=3)
+        self.status_lbl = ttk.Label(bar, text="Status: Disconnected",
+                                    foreground="#ff7070")
+        self.status_lbl.pack(side=tk.RIGHT, padx=8)
+
+    def _build_transfer_bar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill=tk.X, pady=3)
+
+        btn_box = ttk.Frame(bar)
+        btn_box.pack(side=tk.LEFT)
+
+        ttk.Button(btn_box, text="📤  Android → PC",
+                   style="Transfer.TButton",
+                   command=self._transfer_android_to_pc,
+                   width=18).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_box, text="PC → Android  📥",
+                   style="Transfer.TButton",
+                   command=self._transfer_pc_to_android,
+                   width=18).pack(side=tk.LEFT, padx=4)
+
+        # Progress bar container
+        self._progress_box = ttk.Frame(bar)
+        self._progress_box.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=8)
+
+        lbl_row = ttk.Frame(self._progress_box)
+        lbl_row.pack(fill=tk.X)
+
+        self._progress_status = tk.StringVar()
+        self._progress_lbl = ttk.Label(lbl_row, textvariable=self._progress_status,
+                                       font=("Arial", 9, "bold"))
+        self._progress_lbl.pack(side=tk.LEFT)
+
+        self._progress_speed_text = tk.StringVar()
+        self._progress_speed_lbl = ttk.Label(lbl_row, textvariable=self._progress_speed_text,
+                                             font=("Arial", 9), foreground="#69f0ae")
+        self._progress_speed_lbl.pack(side=tk.RIGHT)
+
+        bar_row = ttk.Frame(self._progress_box)
+        bar_row.pack(fill=tk.X, pady=(2, 0))
+
+        self.progress_var = tk.DoubleVar()
+        self._progress_bar = ttk.Progressbar(bar_row, variable=self.progress_var,
+                                             maximum=100)
+        self._progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._cancel_btn = ttk.Button(bar_row, text="🛑 Cancel",
+                                      command=self.cancel_transfer,
+                                      width=9)
+        self._cancel_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # Initially hidden
+        self._progress_box.pack_forget()
+
+    def _build_log(self, parent):
+        frm = ttk.Frame(parent)
+        frm.pack(fill=tk.X, pady=3)
+        ttk.Label(frm, text="Log:", font=("Arial", 8)).pack(anchor=tk.W)
+        self.log_widget = scrolledtext.ScrolledText(
+            frm, height=4, bg="#1a1a1a", fg="#00e676",
+            font=("Consolas", 8))
+        self.log_widget.pack(fill=tk.X)
+
+    # ── ADB ───────────────────────────────────────────────────────────
+
+    def _check_adb(self):
+        try:
+            subprocess.run(["adb", "version"], capture_output=True, check=True)
+            self._log("✅ ADB detected")
+            self._refresh_devices()
+        except Exception as exc:
+            messagebox.showerror("Error", f"ADB not found!\n{exc}")
+            self.status_lbl.config(text="ADB Error", foreground="red")
+
+    def _refresh_devices(self):
+        try:
+            r = subprocess.run(["adb", "devices"], capture_output=True, text=True)
+            lines   = r.stdout.strip().splitlines()[1:]
+            devices = [l.split("\t")[0] for l in lines
+                       if l.strip() and "device" in l]
+            self.device_combo["values"] = devices
             if devices:
                 self.device_combo.set(devices[0])
                 self.device_id = devices[0]
-                self.status_label.config(text="Status: Device selected", foreground='yellow')
-                self.log(f"📱 Perangkat terdeteksi: {', '.join(devices)}")
-                self.connect_device()
+                self.status_lbl.config(
+                    text=f"Device: {devices[0]}", foreground="#69f0ae")
+                self._log(f"📱 Found: {', '.join(devices)}")
+                self._connect_device()
             else:
-                self.device_combo.set('')
-                self.status_label.config(text="Status: No device", foreground='red')
-                self.log("❌ Tidak ada perangkat terdeteksi")
-        except Exception as e:
-            self.log(f"❌ Error refresh devices: {str(e)}")
+                self.device_combo.set("")
+                self.status_lbl.config(
+                    text="Status: No device", foreground="#ff7070")
+                self._log("❌ No devices detected")
+        except Exception as exc:
+            self._log(f"❌ Refresh: {exc}")
 
-    def on_device_selected(self, event):
+    def _on_device_selected(self, _=None):
         self.device_id = self.device_var.get()
-        self.connect_device()
+        self._connect_device()
 
-    def connect_device(self):
+    def _connect_device(self):
         if not self.device_id:
-            messagebox.showwarning("Warning", "Pilih perangkat terlebih dahulu!")
+            return
+        try:
+            r = subprocess.run(
+                ["adb", "-s", self.device_id, "shell", "echo", "ok"],
+                capture_output=True, text=True, timeout=5)
+            if "ok" in r.stdout:
+                self.status_lbl.config(
+                    text=f"✅ {self.device_id}", foreground="#69f0ae")
+                self._log(f"✅ Connected: {self.device_id}")
+                self.android.refresh()
+                self.pc.refresh()
+            else:
+                self._log(f"❌ Connect failed: {r.stderr[:60]}")
+        except Exception as exc:
+            self._log(f"❌ Connect: {exc}")
+
+    def _run_adb(self, command: list, timeout: int = 60) -> subprocess.CompletedProcess:
+        if not self.device_id:
+            raise RuntimeError("No device connected")
+        return subprocess.run(
+            ["adb", "-s", self.device_id] + command,
+            capture_output=True, text=True, timeout=timeout)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _log(self, message: str):
+        def _do():
+            self.log_widget.insert(
+                tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+            self.log_widget.see(tk.END)
+        self.root.after(0, _do)
+
+    def _set_progress(self, visible: bool, value: float = 0,
+                      status: str = "", speed_info: str = "",
+                      mode: str = "determinate"):
+        def _do():
+            if visible:
+                self._progress_status.set(status)
+                self._progress_speed_text.set(speed_info)
+                self._progress_bar.config(mode=mode)
+                if mode == "indeterminate":
+                    self._progress_bar.start(12)
+                else:
+                    self._progress_bar.stop()
+                    self.progress_var.set(value)
+                self._progress_box.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=8)
+            else:
+                self._progress_bar.stop()
+                self._progress_box.pack_forget()
+        self.root.after(0, _do)
+
+    @staticmethod
+    def _child_of(widget, panel: FilePanel) -> bool:
+        w = widget
+        while w:
+            if w is panel:
+                return True
+            try:
+                w = w.master
+            except AttributeError:
+                break
+        return False
+
+    def cancel_transfer(self):
+        """Batalkan proses transfer yang sedang berjalan."""
+        if not self.is_operating:
+            return
+        self._cancel_requested = True
+        self._log("🛑 Membatalkan transfer...")
+        if self._current_transfer_proc:
+            try:
+                self._current_transfer_proc.terminate()
+            except Exception:
+                try:
+                    self._current_transfer_proc.kill()
+                except Exception:
+                    pass
+
+    # ── Clipboard Handlers (Copy, Cut, Paste) ─────────────────────────
+
+    def _clipboard_copy(self, panel: FilePanel, source_dir: str, items: List[FileItem]):
+        self._clipboard_items = list(items)
+        self._clipboard_action = "copy"
+        self._clipboard_source_panel = panel
+        self._clipboard_source_dir = source_dir
+        self._log(f"📋 Salin {len(items)} item ke clipboard")
+
+    def _clipboard_cut(self, panel: FilePanel, source_dir: str, items: List[FileItem]):
+        self._clipboard_items = list(items)
+        self._clipboard_action = "cut"
+        self._clipboard_source_panel = panel
+        self._clipboard_source_dir = source_dir
+        self._log(f"✂️ Potong (Cut) {len(items)} item ke clipboard")
+
+    def _clipboard_paste(self, target_panel: FilePanel, target_dir: str):
+        if not self._clipboard_items or not self._clipboard_action:
+            messagebox.showinfo("Info", "Clipboard kosong! Silakan Copy atau Cut item terlebih dahulu.", parent=self.root)
+            return
+        if self.is_operating:
+            messagebox.showwarning("Busy", "Operasi transfer sedang berjalan!", parent=self.root)
             return
 
-        try:
-            self.log(f"🔌 Mencoba koneksi ke {self.device_id}...")
-            cmd = ['adb', '-s', self.device_id, 'shell', 'echo', 'connected']
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        src_panel = self._clipboard_source_panel
+        src_dir   = self._clipboard_source_dir
+        action    = self._clipboard_action
+        items     = list(self._clipboard_items)
 
-            if 'connected' in result.stdout:
-                self.status_label.config(text=f"Status: Connected to {self.device_id}",
-                                        foreground='green')
-                self.log(f"✅ Terhubung ke {self.device_id}")
-                self.refresh_current()
+        if src_panel == target_panel:
+            # Internal paste di dalam panel yang sama
+            if target_panel == self.android:
+                self._paste_android_internal(items, action, src_dir, target_dir)
             else:
-                self.log(f"❌ Gagal terhubung: {result.stderr}")
-                messagebox.showerror("Error", f"Gagal terhubung ke perangkat\n{result.stderr}")
-        except Exception as e:
-            self.log(f"❌ Error koneksi: {str(e)}")
-            messagebox.showerror("Error", f"Gagal terhubung: {str(e)}")
+                self._paste_pc_internal(items, action, src_dir, target_dir)
+        else:
+            # Cross-panel paste (Android <-> PC)
+            is_cut = (action == "cut")
+            if src_panel == self.android and target_panel == self.pc:
+                self._run_transfer(items, "android_to_pc", src_dir, target_dir, delete_source=is_cut)
+            elif src_panel == self.pc and target_panel == self.android:
+                self._run_transfer(items, "pc_to_android", src_dir, target_dir, delete_source=is_cut)
 
-    def log(self, message):
-        def _append_log():
-            timestamp = time.strftime('%H:%M:%S')
-            self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-            self.log_text.see(tk.END)
-        self.root.after(0, _append_log)
+        if action == "cut":
+            self._clipboard_items = []
+            self._clipboard_action = None
 
-    def set_progress_ui(self, visible, value=0, status="", mode="determinate"):
-        def _update():
-            if visible:
-                self.progress_status_label.config(text=status)
-                self.progress_status_label.pack(fill=tk.X, pady=1)
-                self.progress.config(mode=mode)
-                if mode == "indeterminate":
-                    self.progress.start(10)
-                else:
-                    self.progress.stop()
-                    self.progress_var.set(value)
-                self.progress.pack(fill=tk.X, pady=2)
-            else:
-                self.progress.stop()
-                self.progress.pack_forget()
-                self.progress_status_label.pack_forget()
-        self.root.after(0, _update)
-
-    def run_adb_command(self, command, timeout=30):
-        if not self.device_id:
-            raise Exception("No device connected")
-
-        full_cmd = ['adb', '-s', self.device_id] + command
-
-        if self.debug_mode:
-            self.log(f"🐛 CMD: {' '.join(full_cmd)}")
-
-        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
-        return result
-
-    def parse_ls_output(self, lines):
-        """Parse output ls -la dengan format Android"""
-        items = []
-
-        for line in lines:
-            if not line.strip() or line.startswith('total'):
-                continue
-
-            parts = line.split()
-            if len(parts) < 8:
-                continue
-
+    def _paste_android_internal(self, items: List[FileItem], action: str, src_dir: str, dst_dir: str):
+        def w():
+            self._set_progress(True, status=f"{'Memindahkan' if action == 'cut' else 'Menyalin'} item…", mode="indeterminate")
             try:
-                permissions = parts[0]
-                if not permissions or len(permissions) < 10:
-                    continue
+                src_base = src_dir.rstrip('/')
+                dst_base = dst_dir.rstrip('/')
+                for fi in items:
+                    sp = f"{src_base}/{fi.name}"
+                    dp = f"{dst_base}/{fi.name}"
 
-                size_index = -1
-                for i, part in enumerate(parts):
-                    if part.isdigit() and i > 2:
-                        size_index = i
+                    if src_base == dst_base:
+                        if action == "cut":
+                            self._log(f"ℹ️ {fi.name} sudah berada di folder tujuan.")
+                            continue
+                        else:
+                            # Jika copy di folder yang sama, buat nama unik
+                            dp = f"{dst_base}/copy_{fi.name}"
+
+                    if action == "cut":
+                        # Coba mv langsung, jika beda filesystem fallback ke cp + rm
+                        cmd = f'if mv "{sp}" "{dp}" 2>/dev/null; then echo SUCCESS; elif cp -r "{sp}" "{dp}" 2>/dev/null && rm -rf "{sp}" 2>/dev/null; then echo SUCCESS; else echo FAIL; fi'
+                        r = self._run_adb(["shell", cmd])
+                        if "SUCCESS" in r.stdout:
+                            self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                        else:
+                            r_err = self._run_adb(["shell", "mv", sp, dp])
+                            if r_err.returncode == 0 and not r_err.stderr.strip():
+                                self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                            else:
+                                self._log(f"❌ Cut error {fi.name}: {r_err.stderr or r.stdout or 'Gagal'}")
+                    else:
+                        cmd = f'if cp -r "{sp}" "{dp}" 2>/dev/null; then echo SUCCESS; else echo FAIL; fi'
+                        r = self._run_adb(["shell", cmd])
+                        if "SUCCESS" in r.stdout:
+                            self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                        else:
+                            r_err = self._run_adb(["shell", "cp", "-r", sp, dp])
+                            if r_err.returncode == 0 and not r_err.stderr.strip():
+                                self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                            else:
+                                self._log(f"❌ Copy error {fi.name}: {r_err.stderr or r.stdout or 'Gagal'}")
+
+                self.android.deselect_all()
+                self.root.after(0, self.android.refresh)
+            finally:
+                self._set_progress(False)
+        threading.Thread(target=w, daemon=True).start()
+
+    def _paste_pc_internal(self, items: List[FileItem], action: str, src_dir: str, dst_dir: str):
+        def w():
+            self._set_progress(True, status=f"{'Memindahkan' if action == 'cut' else 'Menyalin'} item…", mode="indeterminate")
+            try:
+                for fi in items:
+                    sp = os.path.join(src_dir, fi.name)
+                    dp = os.path.join(dst_dir, fi.name)
+
+                    if os.path.abspath(src_dir) == os.path.abspath(dst_dir):
+                        if action == "cut":
+                            self._log(f"ℹ️ {fi.name} sudah berada di folder tujuan.")
+                            continue
+                        else:
+                            dp = os.path.join(dst_dir, f"copy_{fi.name}")
+
+                    try:
+                        if action == "cut":
+                            shutil.move(sp, dp)
+                            self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                        else:
+                            if fi.is_dir:
+                                shutil.copytree(sp, dp, dirs_exist_ok=True)
+                            else:
+                                shutil.copy2(sp, dp)
+                            self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                    except Exception as exc:
+                        self._log(f"❌ Paste error {fi.name}: {exc}")
+
+                self.pc.deselect_all()
+                self.root.after(0, self.pc.refresh)
+            finally:
+                self._set_progress(False)
+        threading.Thread(target=w, daemon=True).start()
+
+    # ── Transfer ──────────────────────────────────────────────────────
+
+    def _transfer_android_to_pc(self):
+        items = self.android.get_checked_items()
+        if not items:
+            messagebox.showinfo("Info", "Pilih file di panel Android terlebih dahulu.")
+            return
+        if self.is_operating:
+            messagebox.showwarning("Busy", "Transfer sedang berjalan!")
+            return
+        self._run_transfer(items, "android_to_pc",
+                           self.android.current_path, self.pc.current_path)
+
+    def _transfer_pc_to_android(self):
+        items = self.pc.get_checked_items()
+        if not items:
+            messagebox.showinfo("Info", "Pilih file di panel PC terlebih dahulu.")
+            return
+        if self.is_operating:
+            messagebox.showwarning("Busy", "Transfer sedang berjalan!")
+            return
+        self._run_transfer(items, "pc_to_android",
+                           self.pc.current_path, self.android.current_path)
+
+    def _run_transfer(self, items: List[FileItem], direction: str,
+                      src_dir: str, dst_dir: str, delete_source: bool = False):
+        self.is_operating = True
+        total_items = len(items)
+        label = ("📤 Android→PC" if direction == "android_to_pc" else "📥 PC→Android")
+
+        # Hitung total bytes semua item (jika diketahui)
+        def get_item_size(fi: FileItem) -> int:
+            if direction == "pc_to_android":
+                local_path = os.path.join(src_dir, fi.name)
+                if os.path.exists(local_path) and not fi.is_dir:
+                    try:
+                        return os.path.getsize(local_path)
+                    except OSError:
+                        pass
+            return fi.size_bytes
+
+        item_sizes = [get_item_size(fi) for fi in items]
+        total_all_bytes = sum(item_sizes)
+
+        pct_re = re.compile(r"\[\s*(\d+)%\]|(\d+)%")
+        speed_re = re.compile(r"(\d+(?:\.\d+)?\s*(?:[KkMmGg]?[Bb]/s|[KkMmGg]B/s|[KkMmGg]b/s))")
+
+        def build_cmd(fi: FileItem) -> list:
+            if direction == "android_to_pc":
+                return ["adb", "-s", self.device_id, "pull",
+                        f"{src_dir}/{fi.name}",
+                        os.path.join(dst_dir, fi.name)]
+            return ["adb", "-s", self.device_id, "push",
+                    os.path.join(src_dir, fi.name),
+                    f"{dst_dir}/{fi.name}"]
+
+        def worker():
+            self._cancel_requested = False
+            try:
+                # Cek jika ada ukuran 0 pada Android -> PC, coba query stat
+                for i, fi in enumerate(items):
+                    if direction == "android_to_pc" and item_sizes[i] == 0 and not fi.is_dir:
+                        try:
+                            r_stat = self._run_adb(["shell", "stat", "-c", "%s", f"{src_dir}/{fi.name}"], timeout=3)
+                            if r_stat.returncode == 0 and r_stat.stdout.strip().isdigit():
+                                item_sizes[i] = int(r_stat.stdout.strip())
+                        except Exception:
+                            pass
+                total_bytes_calc = sum(item_sizes)
+
+                bytes_transferred_prev = 0
+
+                for idx, fi in enumerate(items):
+                    if self._cancel_requested:
+                        self._log("⚠️ Transfer dibatalkan oleh pengguna.")
                         break
 
-                if size_index == -1:
-                    continue
+                    file_total_bytes = item_sizes[idx]
+                    dst_file_path = (os.path.join(dst_dir, fi.name)
+                                     if direction == "android_to_pc" else None)
 
-                size = parts[size_index]
+                    # Initial progress status
+                    base_pct = (bytes_transferred_prev / total_bytes_calc * 100
+                                if total_bytes_calc > 0 else (idx / total_items * 100))
+                    self._set_progress(
+                        True, value=base_pct,
+                        status=f"{label}: {fi.name} ({idx+1}/{total_items})",
+                        speed_info=f"0% • 0 KB/s",
+                        mode="determinate")
+                    self._log(f"  → Mulai transfer: {fi.name} ({format_bytes(file_total_bytes)})")
 
-                if size_index + 2 < len(parts):
-                    date_part = parts[size_index + 1]
-                    time_part = parts[size_index + 2]
-                    modified = f"{date_part} {time_part}"
-                    name_start = size_index + 3
-                else:
-                    name_start = 8
-                    modified = ""
-
-                name_parts = parts[name_start:]
-                name = ' '.join(name_parts)
-
-                if not name or name in ['.', '..']:
-                    continue
-
-                is_dir = permissions.startswith('d')
-                is_link = permissions.startswith('l')
-
-                items.append({
-                    'name': name,
-                    'size': size,
-                    'is_dir': is_dir,
-                    'is_link': is_link,
-                    'permissions': permissions,
-                    'modified': modified
-                })
-
-            except Exception as e:
-                continue
-
-        return items
-
-    def update_treeview(self):
-        """Render item yang tersimpan di self.items ke Treeview"""
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        for item in self.items:
-            icon = '📁' if item['is_dir'] else ('🔗' if item.get('is_link') else '📄')
-            item_id = self.tree.insert('', 'end',
-                                      text=f"{icon} {item['name']}",
-                                      values=(item['size'], item['modified']))
-            item['id'] = item_id
-
-        # Update indikator header
-        name_hdr = "Name"
-        size_hdr = "Size"
-        mod_hdr = "Modified"
-
-        if self.sort_state['column'] == 'name':
-            name_hdr += " ▲" if self.sort_state['dir'] == 'asc' else " ▼"
-        elif self.sort_state['column'] == 'size':
-            size_hdr += " ▲" if self.sort_state['dir'] == 'asc' else " ▼"
-        elif self.sort_state['column'] == 'modified':
-            mod_hdr += " ▲" if self.sort_state['dir'] == 'asc' else " ▼"
-
-        self.tree.heading('#0', text=name_hdr)
-        self.tree.heading('Size', text=size_hdr)
-        self.tree.heading('Modified', text=mod_hdr)
-
-    def toggle_sort(self, column):
-        """Mengatur siklus sort: Ascending -> Descending -> Default (Original)"""
-        if self.sort_state['column'] != column:
-            self.sort_state['column'] = column
-            self.sort_state['dir'] = 'asc'
-        elif self.sort_state['dir'] == 'asc':
-            self.sort_state['dir'] = 'desc'
-        else:
-            self.sort_state['column'] = None
-            self.sort_state['dir'] = None
-
-        self.apply_sorting()
-
-    def parse_size_to_bytes(self, size_str):
-        """Konversi string size ke integer untuk pengurutan akurat"""
-        if not size_str or not str(size_str).isdigit():
-            return -1
-        return int(size_str)
-
-    def apply_sorting(self):
-        col = self.sort_state['column']
-        direction = self.sort_state['dir']
-
-        if not col or not direction:
-            # Kembali ke urutan asli dari raw_items
-            self.items = list(self.raw_items)
-        else:
-            reverse = (direction == 'desc')
-
-            # Pisahkan direktori dan file agar direktori selalu berada di atas (atau disesuaikan)
-            dirs = [x for x in self.raw_items if x['is_dir']]
-            files = [x for x in self.raw_items if not x['is_dir']]
-
-            if col == 'name':
-                dirs.sort(key=lambda x: x['name'].lower(), reverse=reverse)
-                files.sort(key=lambda x: x['name'].lower(), reverse=reverse)
-            elif col == 'size':
-                dirs.sort(key=lambda x: self.parse_size_to_bytes(x['size']), reverse=reverse)
-                files.sort(key=lambda x: self.parse_size_to_bytes(x['size']), reverse=reverse)
-            elif col == 'modified':
-                dirs.sort(key=lambda x: x['modified'], reverse=reverse)
-                files.sort(key=lambda x: x['modified'], reverse=reverse)
-
-            self.items = dirs + files
-
-        self.update_treeview()
-
-    def refresh_current(self):
-        """Refresh tampilan direktori saat ini secara terpisah"""
-        if not self.device_id:
-            self.log("⚠️ No device connected")
-            return
-
-        def worker():
-            try:
-                self.log(f"📂 Reading directory: {self.current_path}")
-                cmd = ['shell', 'ls', '-la', self.current_path]
-                result = self.run_adb_command(cmd)
-
-                if result.returncode != 0:
-                    cmd = ['shell', 'ls', self.current_path]
-                    result = self.run_adb_command(cmd)
-                    if result.returncode == 0:
-                        lines = result.stdout.strip().split('\n')
-                        raw = []
-                        for name in lines:
-                            if name.strip() and name not in ['.', '..']:
-                                raw.append({
-                                    'name': name,
-                                    'size': '',
-                                    'is_dir': False,
-                                    'is_link': False,
-                                    'permissions': '',
-                                    'modified': ''
-                                })
-                        self.raw_items = raw
-                        self.root.after(0, self.apply_sorting)
-                        self.root.after(0, lambda: self.path_var.set(self.current_path))
-                        self.log(f"📂 Found {len(self.raw_items)} items")
-                        return
+                    # Jalankan subprocess dengan PTY di Linux/macOS agar ADB memancarkan status realtime
+                    master_fd = None
+                    slave_fd = None
+                    if HAS_PTY and os.name != 'nt':
+                        master_fd, slave_fd = pty.openpty()
+                        proc = subprocess.Popen(
+                            build_cmd(fi),
+                            stdin=subprocess.DEVNULL,
+                            stdout=slave_fd,
+                            stderr=slave_fd,
+                            close_fds=True
+                        )
+                        os.close(slave_fd)
+                        out_stream = os.fdopen(master_fd, 'rb', buffering=0)
                     else:
-                        self.log(f"❌ Gagal membaca direktori: {result.stderr}")
-                        return
+                        proc = subprocess.Popen(
+                            build_cmd(fi),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            bufsize=0
+                        )
+                        out_stream = proc.stdout
 
-                lines = result.stdout.strip().split('\n')
-                self.raw_items = self.parse_ls_output(lines)
-                self.root.after(0, self.apply_sorting)
-                self.root.after(0, lambda: self.path_var.set(self.current_path))
-                self.log(f"✅ Successfully loaded {len(self.raw_items)} items from {self.current_path}")
+                    self._current_transfer_proc = proc
 
-            except Exception as e:
-                self.log(f"❌ Error refresh: {str(e)}")
+                    transfer_done = threading.Event()
+                    active_cur_bytes = [0]
+                    active_speed_str = ["0 KB/s"]
+                    last_sample = {"time": time.time(), "bytes": 0}
 
-        threading.Thread(target=worker, daemon=True).start()
+                    # Background poller untuk memantau ukuran file secara realtime
+                    def poller():
+                        while not transfer_done.is_set() and not self._cancel_requested:
+                            cur = None
+                            if direction == "android_to_pc" and dst_file_path:
+                                if os.path.exists(dst_file_path):
+                                    try:
+                                        cur = os.path.getsize(dst_file_path)
+                                    except OSError:
+                                        cur = None
+                            elif direction == "pc_to_android":
+                                try:
+                                    # Query ukuran file target di Android via stat shell
+                                    target_android_path = f"{dst_dir.rstrip('/')}/{fi.name}"
+                                    r_sz = subprocess.run(
+                                        ["adb", "-s", self.device_id, "shell", "stat", "-c", "%s", f'"{target_android_path}"'],
+                                        capture_output=True, text=True, timeout=1.5)
+                                    out_text = r_sz.stdout.strip()
+                                    if out_text.isdigit():
+                                        cur = int(out_text)
+                                except Exception:
+                                    cur = None
 
-    def show_debug_info(self):
-        """Tampilkan informasi debug"""
-        debug_window = tk.Toplevel(self.root)
-        debug_window.title("Debug Information")
-        debug_window.geometry("700x500")
+                            if cur is not None:
+                                now = time.time()
+                                dt = now - last_sample["time"]
+                                if dt >= 0.2:
+                                    db = max(0, cur - last_sample["bytes"])
+                                    speed = db / dt if dt > 0 else 0
+                                    active_speed_str[0] = format_speed(speed)
+                                    last_sample["time"] = now
+                                    last_sample["bytes"] = cur
+                                active_cur_bytes[0] = cur
 
-        text_widget = scrolledtext.ScrolledText(debug_window)
-        text_widget.pack(fill=tk.BOTH, expand=True)
+                                if file_total_bytes > 0:
+                                    fpct = min(100.0, cur / file_total_bytes * 100.0)
+                                    overall = min(100.0, (bytes_transferred_prev + cur) / total_bytes_calc * 100.0) if total_bytes_calc > 0 else (idx + fpct/100)/total_items*100
+                                    self._set_progress(
+                                        True, value=overall,
+                                        status=f"{label}: {fi.name} ({idx+1}/{total_items}) - {fpct:.1f}%",
+                                        speed_info=f"{format_bytes(cur)} / {format_bytes(file_total_bytes)} • {active_speed_str[0]}",
+                                        mode="determinate")
 
-        info = []
-        info.append("=== DEBUG INFORMATION ===")
-        info.append(f"Device: {self.device_id}")
-        info.append(f"Current Path: {self.current_path}")
-        info.append(f"Items Count: {len(self.items)}")
-        info.append(f"Sort State: {self.sort_state}")
-        info.append("")
+                            time.sleep(0.1 if direction == "android_to_pc" else 0.25)
 
-        info.append("=== CURRENT ITEMS ===")
-        for item in self.items[:20]:
-            info.append(f"  {item['name']} - {'DIR' if item['is_dir'] else 'FILE'} - {item['size']}")
-        if len(self.items) > 20:
-            info.append(f"  ... dan {len(self.items) - 20} lainnya")
+                    if not fi.is_dir:
+                        t_poll = threading.Thread(target=poller, daemon=True)
+                        t_poll.start()
 
-        text_widget.insert(tk.END, '\n'.join(info))
-        text_widget.configure(state='disabled')
+                    # Stream reader untuk output ADB (membaca chunk \r dan \n dari TTY/Pipe)
+                    raw_buf = b""
+                    while not self._cancel_requested and proc.poll() is None:
+                        try:
+                            chunk = out_stream.read(64)
+                            if not chunk:
+                                break
+                            raw_buf += chunk
 
-    def go_to_path(self):
-        path = self.path_var.get().strip()
-        if path:
-            self.current_path = path
-            self.refresh_current()
+                            while b'\r' in raw_buf or b'\n' in raw_buf:
+                                ir = raw_buf.find(b'\r')
+                                in_ = raw_buf.find(b'\n')
+                                idx_split = min(ir if ir != -1 else 999999, in_ if in_ != -1 else 999999)
+                                line_bytes = raw_buf[:idx_split]
+                                raw_buf = raw_buf[idx_split+1:]
+                                line = line_bytes.decode('utf-8', errors='ignore').strip()
+                                if not line:
+                                    continue
 
-    def go_up(self):
-        parent = os.path.dirname(self.current_path)
-        if parent and parent != self.current_path:
-            self.current_path = parent
-            self.refresh_current()
+                                # Cari persen dan speed
+                                m_pct = pct_re.search(line)
+                                m_spd = speed_re.search(line)
 
-    def go_home(self):
-        self.current_path = "/storage/emulated/0"
-        self.refresh_current()
+                                if m_spd:
+                                    active_speed_str[0] = m_spd.group(1).strip()
 
-    def on_item_double_click(self, event):
-        selection = self.tree.selection()
-        if selection:
-            item = selection[0]
-            name = self.tree.item(item, 'text')
-            name = name.split(' ', 1)[1] if ' ' in name else name
+                                if m_pct:
+                                    pct_val = int(m_pct.group(1) or m_pct.group(2))
+                                    cur_b = int(file_total_bytes * (pct_val / 100)) if file_total_bytes > 0 else 0
+                                    overall = ((bytes_transferred_prev + cur_b) / total_bytes_calc * 100.0
+                                               if total_bytes_calc > 0 else (idx + pct_val / 100) / total_items * 100)
+                                    self._set_progress(
+                                        True, value=overall,
+                                        status=f"{label}: {fi.name} ({idx+1}/{total_items}) - {pct_val}%",
+                                        speed_info=f"{format_bytes(cur_b)} / {format_bytes(file_total_bytes)} • {active_speed_str[0]}",
+                                        mode="determinate")
+                                elif m_spd and file_total_bytes > 0:
+                                    self._set_progress(
+                                        True, value=base_pct,
+                                        status=f"{label}: {fi.name} ({idx+1}/{total_items})",
+                                        speed_info=f"{format_bytes(active_cur_bytes[0])} / {format_bytes(file_total_bytes)} • {active_speed_str[0]}",
+                                        mode="determinate")
+                        except Exception:
+                            break
 
-            for file_item in self.items:
-                if file_item['name'] == name and file_item['is_dir']:
-                    new_path = os.path.join(self.current_path, name)
-                    self.current_path = new_path
-                    self.refresh_current()
-                    return
-
-    def hide_context_menu(self, event=None):
-        try:
-            self.context_menu.unpost()
-        except Exception:
-            pass
-
-    def _on_selection_change(self, event=None):
-        """Tutup context menu saat berpindah baris via klik kiri / keyboard.
-        Gunakan after(10) agar tidak bertabrakan dengan event klik kanan."""
-        if self._context_menu_from_rightclick:
-            # Seleksi ini berasal dari right-click show_context_menu, abaikan
-            self._context_menu_from_rightclick = False
-            return
-        self.root.after(10, self.hide_context_menu)
-
-    def show_context_menu(self, event):
-        item_id = self.tree.identify_row(event.y)
-        if item_id:
-            # Tandai bahwa perubahan seleksi ini berasal dari right-click
-            self._context_menu_from_rightclick = True
-            self.tree.selection_set(item_id)
-            self.tree.focus(item_id)
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
-
-    def get_selected_item(self):
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showwarning("Warning", "Pilih item terlebih dahulu!")
-            return None
-
-        item = selection[0]
-        name = self.tree.item(item, 'text')
-        name = name.split(' ', 1)[1] if ' ' in name else name
-
-        for file_item in self.items:
-            if file_item['name'] == name:
-                return file_item
-        return None
-
-    def open_selected(self):
-        item = self.get_selected_item()
-        if item and item['is_dir']:
-            self.current_path = os.path.join(self.current_path, item['name'])
-            self.refresh_current()
-
-    def copy_selected(self):
-        item = self.get_selected_item()
-        if item:
-            self.clipboard = {
-                'path': os.path.join(self.current_path, item['name']),
-                'name': item['name'],
-                'is_dir': item['is_dir']
-            }
-            self.clipboard_type = 'copy'
-            self.log(f"📋 Copied: {item['name']}")
-
-    def cut_selected(self):
-        item = self.get_selected_item()
-        if item:
-            self.clipboard = {
-                'path': os.path.join(self.current_path, item['name']),
-                'name': item['name'],
-                'is_dir': item['is_dir']
-            }
-            self.clipboard_type = 'cut'
-            self.log(f"✂️ Cut: {item['name']}")
-
-    def paste_selected(self):
-        if not self.clipboard:
-            messagebox.showinfo("Info", "Clipboard kosong")
-            return
-
-        if self.is_operating:
-            messagebox.showwarning("Warning", "Proses transfer/operasi lain sedang berjalan!")
-            return
-
-        source = self.clipboard['path']
-        dest = os.path.join(self.current_path, self.clipboard['name'])
-
-        if self.check_if_exists(dest):
-            if not messagebox.askyesno("Confirm", f"File {self.clipboard['name']} already exists. Overwrite?"):
-                return
-
-        def worker():
-            self.is_operating = True
-            try:
-                if self.clipboard_type == 'copy':
-                    self.log(f"📋 Copying: {source} -> {dest}")
-                    self.set_progress_ui(True, status="Copying...", mode="indeterminate")
-                    cmd = ['shell', 'cp', '-r', source, dest]
-                    result = self.run_adb_command(cmd, timeout=300)
-                    if result.returncode == 0:
-                        self.log(f"✅ Copied: {source} -> {dest}")
-                        self.refresh_current()
-                    else:
-                        self.log(f"❌ Copy failed: {result.stderr}")
-                elif self.clipboard_type == 'cut':
-                    self.log(f"✂️ Moving: {source} -> {dest}")
-                    self.set_progress_ui(True, status="Moving...", mode="indeterminate")
-                    cmd = ['shell', 'mv', source, dest]
-                    result = self.run_adb_command(cmd, timeout=300)
-                    if result.returncode == 0:
-                        self.log(f"✅ Moved: {source} -> {dest}")
-                        self.clipboard = None
-                        self.refresh_current()
-                    else:
-                        self.log(f"❌ Move failed: {result.stderr}")
-            except Exception as e:
-                self.log(f"❌ Error: {str(e)}")
-            finally:
-                self.is_operating = False
-                self.set_progress_ui(False)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def delete_selected(self):
-        item = self.get_selected_item()
-        if item:
-            if messagebox.askyesno("Confirm Delete", f"Yakin hapus {item['name']}?"):
-                def worker():
-                    self.set_progress_ui(True, status="Deleting...", mode="indeterminate")
+                    transfer_done.set()
+                    proc.wait()
                     try:
-                        path = os.path.join(self.current_path, item['name'])
-                        cmd = ['shell', 'rm', '-rf', path]
-                        result = self.run_adb_command(cmd)
-                        if result.returncode == 0:
-                            self.log(f"🗑 Deleted: {item['name']}")
-                            self.refresh_current()
-                        else:
-                            self.log(f"❌ Delete failed: {result.stderr}")
-                    except Exception as e:
-                        self.log(f"❌ Error: {str(e)}")
-                    finally:
-                        self.set_progress_ui(False)
-                threading.Thread(target=worker, daemon=True).start()
+                        out_stream.close()
+                    except Exception:
+                        pass
+                    self._current_transfer_proc = None
 
-    def rename_selected(self):
-        item = self.get_selected_item()
-        if item:
-            new_name = tk.simpledialog.askstring("Rename",
-                                                f"Rename {item['name']}:",
-                                                initialvalue=item['name'])
-            if new_name and new_name != item['name']:
-                def worker():
-                    try:
-                        old_path = os.path.join(self.current_path, item['name'])
-                        new_path = os.path.join(self.current_path, new_name)
-                        cmd = ['shell', 'mv', old_path, new_path]
-                        result = self.run_adb_command(cmd)
-                        if result.returncode == 0:
-                            self.log(f"🔄 Renamed: {item['name']} -> {new_name}")
-                            self.refresh_current()
-                        else:
-                            self.log(f"❌ Rename failed: {result.stderr}")
-                    except Exception as e:
-                        self.log(f"❌ Error: {str(e)}")
-                threading.Thread(target=worker, daemon=True).start()
+                    if self._cancel_requested:
+                        self._log(f"🛑 Dibatalkan pada file: {fi.name}")
+                        break
 
-    def create_folder(self):
-        name = tk.simpledialog.askstring("New Folder", "Folder name:")
-        if name:
-            def worker():
-                try:
-                    path = os.path.join(self.current_path, name)
-                    cmd = ['shell', 'mkdir', path]
-                    result = self.run_adb_command(cmd)
-                    if result.returncode == 0:
-                        self.log(f"📁 Created folder: {name}")
-                        self.refresh_current()
+                    bytes_transferred_prev += file_total_bytes
+                    if proc.returncode == 0:
+                        self._log(f"✅ Selesai: {fi.name} ({format_bytes(file_total_bytes)})")
+                        # Jika aksi adalah CUT, hapus file sumber setelah transfer sukses
+                        if delete_source:
+                            try:
+                                if direction == "android_to_pc":
+                                    self._run_adb(["shell", f'rm -rf "{src_dir.rstrip("/")}/{fi.name}"'])
+                                else:
+                                    local_src = os.path.join(src_dir, fi.name)
+                                    shutil.rmtree(local_src) if fi.is_dir else os.remove(local_src)
+                                self._log(f"🗑 Dihapus dari sumber: {fi.name}")
+                            except Exception as ex_del:
+                                self._log(f"⚠️ Gagal hapus sumber: {ex_del}")
                     else:
-                        self.log(f"❌ Create folder failed: {result.stderr}")
-                except Exception as e:
-                    self.log(f"❌ Error: {str(e)}")
-            threading.Thread(target=worker, daemon=True).start()
+                        self._log(f"❌ Gagal: {fi.name}")
 
-    def copy_to_pc(self):
-        item = self.get_selected_item()
-        if not item:
-            return
-
-        if self.is_operating:
-            messagebox.showwarning("Warning", "Proses transfer sedang berjalan!")
-            return
-
-        pc_path = filedialog.askdirectory(title="Pilih folder tujuan di PC")
-        if pc_path:
-            android_path = os.path.join(self.current_path, item['name'])
-            dest_path = os.path.join(pc_path, item['name'])
-            self.run_adb_transfer_async(['pull', android_path, dest_path],
-                                        f"📤 Pulling {item['name']} to PC")
-
-    def copy_from_pc(self):
-        if self.is_operating:
-            messagebox.showwarning("Warning", "Proses transfer sedang berjalan!")
-            return
-
-        pc_path = filedialog.askopenfilename(title="Pilih file dari PC")
-        if pc_path:
-            file_name = os.path.basename(pc_path)
-            android_path = os.path.join(self.current_path, file_name)
-            self.run_adb_transfer_async(['push', pc_path, android_path],
-                                        f"📥 Pushing {file_name} to Android",
-                                        refresh_after=True)
-
-    def run_adb_transfer_async(self, command, desc_label, refresh_after=False):
-        """Menjalankan ADB push/pull dengan real-time progress parsing secara asynchronous"""
-        if not self.device_id:
-            messagebox.showwarning("Warning", "Tidak ada device terhubung!")
-            return
-
-        full_cmd = ['adb', '-s', self.device_id] + command
-
-        def worker():
-            self.is_operating = True
-            self.log(desc_label)
-            self.set_progress_ui(True, value=0, status=f"{desc_label}...", mode="determinate")
-
-            try:
-                process = subprocess.Popen(
-                    full_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1
-                )
-
-                progress_regex = re.compile(r'\[\s*(\d+)%\]')
-
-                for line in process.stdout:
-                    match = progress_regex.search(line)
-                    if match:
-                        pct = int(match.group(1))
-                        self.set_progress_ui(True, value=pct, status=f"{desc_label}: {pct}%", mode="determinate")
-
-                process.wait()
-                if process.returncode == 0:
-                    self.log(f"✅ Selesai: {desc_label}")
-                    if refresh_after:
-                        self.refresh_current()
-                else:
-                    self.log(f"❌ Transfer Gagal ({process.returncode})")
-            except Exception as e:
-                self.log(f"❌ Error Transfer: {str(e)}")
+                if not self._cancel_requested:
+                    self._log(f"🎉 Selesai — {total_items} item(s) berhasil ditransfer ({format_bytes(total_bytes_calc)})")
+                dest = (self.pc if direction == "android_to_pc" else self.android)
+                self.root.after(0, dest.refresh)
+                if delete_source:
+                    src_p = (self.android if direction == "android_to_pc" else self.pc)
+                    self.root.after(0, src_p.refresh)
+            except Exception as exc:
+                self._log(f"❌ Transfer error: {exc}")
             finally:
+                self._current_transfer_proc = None
                 self.is_operating = False
-                self.set_progress_ui(False)
+                self._set_progress(False)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def search_files(self):
-        pattern = tk.simpledialog.askstring("Search", "Pattern to search:")
-        if pattern:
-            def worker():
-                try:
-                    self.log(f"🔍 Searching: {pattern} in {self.current_path}")
-                    self.set_progress_ui(True, status="Searching...", mode="indeterminate")
-                    cmd = ['shell', 'find', self.current_path, '-name', f'*{pattern}*']
-                    result = self.run_adb_command(cmd, timeout=60)
 
-                    if result.returncode == 0:
-                        results = result.stdout.strip().split('\n')
-                        if results and results[0]:
-                            def _show_results():
-                                result_window = tk.Toplevel(self.root)
-                                result_window.title("Search Results")
-                                result_window.geometry("600x400")
-
-                                text_widget = scrolledtext.ScrolledText(result_window)
-                                text_widget.pack(fill=tk.BOTH, expand=True)
-
-                                text_widget.insert(tk.END, f"Found {len(results)} files:\n\n")
-                                for file_path in results:
-                                    text_widget.insert(tk.END, f"{file_path}\n")
-                                text_widget.configure(state='disabled')
-                            self.root.after(0, _show_results)
-
-                            self.log(f"🔍 Found {len(results)} files")
-                        else:
-                            self.log("❌ No files found")
-                    else:
-                        self.log(f"❌ Search failed: {result.stderr}")
-                except Exception as e:
-                    self.log(f"❌ Error: {str(e)}")
-                finally:
-                    self.set_progress_ui(False)
-            threading.Thread(target=worker, daemon=True).start()
-
-    def show_storage_info(self):
-        def worker():
-            try:
-                cmd = ['shell', 'df', '-h', '/storage/emulated']
-                result = self.run_adb_command(cmd)
-
-                def _show():
-                    info_window = tk.Toplevel(self.root)
-                    info_window.title("Storage Information")
-                    info_window.geometry("500x300")
-
-                    text_widget = scrolledtext.ScrolledText(info_window)
-                    text_widget.pack(fill=tk.BOTH, expand=True)
-                    text_widget.insert(tk.END, result.stdout)
-                    text_widget.configure(state='disabled')
-                self.root.after(0, _show)
-
-                self.log("📊 Storage info displayed")
-            except Exception as e:
-                self.log(f"❌ Error: {str(e)}")
-        threading.Thread(target=worker, daemon=True).start()
-
-    def check_if_exists(self, path):
-        try:
-            cmd = ['shell', 'ls', path]
-            result = self.run_adb_command(cmd)
-            return result.returncode == 0
-        except:
-            return False
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                        ENTRY POINT                                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 
 def main():
     root = tk.Tk()
-    app = ADBFileManagerGUI(root)
-
+    ADBFileManagerApp(root)
     try:
-        root.iconbitmap(default='icon.ico')
-    except:
+        root.iconbitmap(default="icon.ico")
+    except Exception:
         pass
-
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

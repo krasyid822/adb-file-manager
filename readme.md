@@ -121,12 +121,12 @@ Klik dua kali `adb-file-manager-windows.exe`
 - 📋 Copy, Cut, Paste file
 - 🗑 Hapus file/folder
 - 🔄 Rename file/folder
-- 📤 Copy file dari Android ke PC
-- 📥 Copy file dari PC ke Android (push)
-- 🔍 Cari file berdasarkan nama
-- 📊 Informasi penyimpanan
-- **Sorting** kolom Name / Size / Modified (Ascending / Descending / Default)
-- **Transfer progress** real-time untuk push/pull
+- ⚡ **Dual Panel (Split UI)**: Manager Android di sisi kiri, PC di sisi kanan (bisa di-resize)
+- 🖱 **Drag & Drop**: Pindahkan file antar panel hanya dengan menggeser mouse
+- ☑️ **Multi-Select Checkbox & Highlight**: Centang beberapa file sekaligus dengan penandaan visual yang tegas
+- 📊 **Sort by Type**: Pengurutan berdasarkan ekstensi jenis file, nama, ukuran, dan tanggal modifikasi
+- 📈 **Real-time Transfer Progress**: Indikator persentase akurat, total ukuran file (bytes/MB/GB), dan kecepatan transfer (KB/s / MB/s)
+- 📂 Manajemen file lengkap: Buka, Buat Folder Baru, Rename, dan Hapus
 
 ---
 
@@ -136,3 +136,4 @@ Butuh Python 3.8+:
 ```bash
 python3 "ADB File Manager.py"
 ```
+
