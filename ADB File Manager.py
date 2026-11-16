@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
 import threading
 import time
+import tempfile
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -696,12 +697,22 @@ class AndroidPanel(FilePanel):
             base_dir = self.current_path.rstrip('/')
             old_p = f"{base_dir}/{fi.name}"
             new_p = f"{base_dir}/{new}"
+            status, resolved = self._resolve_dst(new_p, new, True)
+            if status == "cancel":
+                self._log("⚠️ Rename dibatalkan.")
+                return
+            if status == "skip":
+                self._log(f"⏭ Dilewati (sudah ada): {new}")
+                return
+            new_p = resolved
             r = self._run_adb(["shell", f'mv "{old_p}" "{new_p}"'])
             if r.returncode != 0:
                 r = self._run_adb(["shell", "mv", old_p, new_p])
-            self._log(f"✏️ Renamed: {fi.name} → {new}" if r.returncode == 0
+            self._log(f"✏️ Renamed: {fi.name} → {os.path.basename(new_p)}" if r.returncode == 0
                       else f"❌ Rename: {r.stderr}")
             if r.returncode == 0:
+                self.undo.push(UndoEntry(op="rename", source=old_p, dest=new_p,
+                                         is_dir=fi.is_dir, android=True))
                 self.winfo_toplevel().after(0, self.refresh)
         threading.Thread(target=w, daemon=True).start()
 
@@ -722,13 +733,41 @@ class AndroidPanel(FilePanel):
         def w():
             try:
                 base_dir = self.current_path.rstrip('/')
+                device_id = self._get_device_id()
                 for fi in checked:
                     target_p = f"{base_dir}/{fi.name}"
-                    r = self._run_adb(["shell", f'rm -rf "{target_p}"'])
-                    if r.returncode != 0:
-                        r = self._run_adb(["shell", "rm", "-rf", target_p])
+                    backup = ""
+                    # Cadangkan ke PC sebelum dihapus dari perangkat, dalam subfolder per device_id
+                    if device_id:
+                        try:
+                            bname = f"del_{int(time.time()*1000)}_{fi.name}"
+                            bdir = os.path.join(UNDO_DIR, device_id)
+                            os.makedirs(bdir, exist_ok=True)
+                            bpath = os.path.join(bdir, bname)
+                            r_pull = subprocess.run(
+                                ["adb", "-s", device_id, "pull", target_p, bpath],
+                                capture_output=True, text=True, timeout=60)
+                            if r_pull.returncode == 0:
+                                backup = bpath
+                                self._log(f"💾 Cadang: {fi.name} → {bpath}")
+                            else:
+                                self._log(f"⚠️ Tidak dapat cadangkan {fi.name} dari perangkat untuk undo: {r_pull.stderr[:120]}")
+                        except Exception as exc:
+                            self._log(f"❌ Gagal cadang {fi.name}: {exc}")
+                    # Hapus dari perangkat
+                    try:
+                        r = self._run_adb(["shell", f'rm -rf "{target_p}"'])
+                        if r.returncode != 0:
+                            r = self._run_adb(["shell", "rm", "-rf", target_p])
+                    except Exception as exc:
+                        self._log(f"❌ Gagal rm {fi.name}: {exc}")
+                        continue
                     self._log(f"🗑 Deleted: {fi.name}" if r.returncode == 0
                               else f"❌ Delete {fi.name}: {r.stderr}")
+                    if r.returncode == 0:
+                        self.undo.push(UndoEntry(op="delete", source=target_p, dest="",
+                                                 is_dir=fi.is_dir, backup=backup,
+                                                 android=True, device_id=device_id or ""))
                 self.deselect_all()
                 self.winfo_toplevel().after(0, self.refresh)
             finally:
@@ -844,10 +883,21 @@ class PCPanel(FilePanel):
                                      initialvalue=fi.name, parent=self)
         if not new or new == fi.name:
             return
+        src = os.path.join(self.current_path, fi.name)
+        dst = os.path.join(self.current_path, new)
+        status, resolved = self._resolve_dst(dst, new, False)
+        if status == "cancel":
+            self._log("⚠️ Rename dibatalkan.")
+            return
+        if status == "skip":
+            self._log(f"⏭ Dilewati (sudah ada): {new}")
+            return
+        dst = resolved
         try:
-            os.rename(os.path.join(self.current_path, fi.name),
-                      os.path.join(self.current_path, new))
-            self._log(f"✏️ Renamed: {fi.name} → {new}")
+            os.rename(src, dst)
+            self._log(f"✏️ Renamed: {fi.name} → {os.path.basename(dst)}")
+            self.undo.push(UndoEntry(op="rename", source=src, dest=dst,
+                                     is_dir=fi.is_dir, android=False))
             self.winfo_toplevel().after(0, self.refresh)
         except Exception as exc:
             self._log(f"❌ Rename: {exc}")
@@ -863,12 +913,258 @@ class PCPanel(FilePanel):
             return
         for fi in checked:
             path = os.path.join(self.current_path, fi.name)
+            backup = ""
             try:
+                # Cadangkan untuk undo
+                bname = f"del_{int(time.time()*1000)}_{fi.name}"
+                bpath = os.path.join(UNDO_DIR, bname)
+                if fi.is_dir:
+                    shutil.copytree(path, bpath)
+                else:
+                    shutil.copy2(path, bpath)
+                backup = bpath
                 shutil.rmtree(path) if fi.is_dir else os.remove(path)
                 self._log(f"🗑 Deleted: {fi.name}")
+                self.undo.push(UndoEntry(op="delete", source=path, dest="",
+                                         is_dir=fi.is_dir, backup=backup, android=False))
             except Exception as exc:
                 self._log(f"❌ Delete {fi.name}: {exc}")
         self.winfo_toplevel().after(0, self.refresh)
+
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║                     UNDO MANAGER & OVERWRITE GUARD                   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
+UNDO_MAX = 50
+UNDO_DIR = os.path.join(tempfile.gettempdir(), "adb_file_manager_undo")
+# Folder tujuan pemulihan di perangkat untuk file yang berasal dari trash.
+# Folder '.trash-storage' dilindungi Android: hapus boleh, buat/push ditolak
+# (Operation not permitted). Karena itu file trash dipulihkan ke folder biasa
+# ini di Download agar tetap bisa ditulis lewat ADB.
+ANDROID_RESTORE_DIR = "/storage/emulated/0/Download/ADB File Manager Restore"
+
+
+class UndoEntry:
+    __slots__ = ("op", "source", "dest", "is_dir", "backup", "android", "when", "device_id")
+
+    def __init__(self, op, source, dest, is_dir=False, backup="", android=False, device_id=""):
+        self.op = op        # 'copy' | 'move' | 'rename' | 'delete'
+        self.source = source
+        self.dest = dest
+        self.is_dir = is_dir
+        self.backup = backup
+        self.android = android
+        self.device_id = device_id   # serial ADB perangkat (untuk cadangan delete android)
+        self.when = time.time()
+
+
+class UndoManager:
+    """Stack operasi yang dapat dibatalkan (undo)."""
+
+    def __init__(self, log_fn, run_adb_fn=None, get_device_id_fn=None):
+        self._log = log_fn
+        self._run_adb = run_adb_fn
+        self._get_device_id = get_device_id_fn
+        self._stack: List[UndoEntry] = []
+        try:
+            os.makedirs(UNDO_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+    def can_undo(self) -> bool:
+        return len(self._stack) > 0
+
+    def push(self, entry: UndoEntry):
+        self._stack.append(entry)
+        if len(self._stack) > UNDO_MAX:
+            self._stack.pop(0)
+
+    def clear(self):
+        self._stack.clear()
+
+    def last_description(self) -> str:
+        if not self._stack:
+            return "(kosong)"
+        e = self._stack[-1]
+        tag = "📱" if e.android else "💻"
+        return f"{tag} {e.op}: {os.path.basename(e.source)} → {os.path.basename(e.dest)}"
+
+    def undo(self):
+        if not self._stack:
+            return False, "Tidak ada operasi yang dapat dibatalkan."
+        entry = self._stack.pop()
+        try:
+            ok, msg = self._reverse(entry)
+            if ok:
+                self._log(f"↩️ Undo {entry.op}: {os.path.basename(entry.source)}")
+            else:
+                self._log(f"⚠️ Undo dibatalkan: {msg}")
+            return ok, msg
+        except Exception as exc:
+            self._log(f"❌ Undo gagal: {exc}")
+            return False, str(exc)
+
+    # ── reversal ────────────────────────────────────────────────────
+    def _android_cmd(self, *args):
+        if not self._run_adb or not self._get_device_id:
+            raise RuntimeError("ADB tidak tersedia untuk undo")
+        if not self._get_device_id():
+            raise RuntimeError("Tidak ada perangkat terhubung")
+        return self._run_adb(list(args))
+
+    def _remove_path(self, path, is_dir):
+        if is_dir:
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    def _reverse(self, entry: UndoEntry):
+        op = entry.op
+        src, dst = entry.source, entry.dest
+        if entry.android:
+            return self._reverse_android(entry)
+        if op == "copy":
+            self._remove_path(dst, entry.is_dir)
+            return True, f"Dihapus salinan: {os.path.basename(dst)}"
+        if op == "move":
+            if not os.path.exists(dst):
+                return False, f"Tujuan tidak ada: {os.path.basename(dst)}"
+            target = src
+            if os.path.exists(target):
+                target = self._unique_local_path(target)
+            shutil.move(dst, target)
+            return True, f"Dikembalikan: {os.path.basename(target)}"
+        if op == "rename":
+            if not os.path.exists(dst):
+                return False, f"Tujuan tidak ada: {os.path.basename(dst)}"
+            target = src
+            if os.path.exists(target):
+                target = self._unique_local_path(target)
+            os.rename(dst, target)
+            return True, f"Dikembalikan nama: {os.path.basename(target)}"
+        if op == "delete":
+            if entry.backup and os.path.exists(entry.backup):
+                target = src
+                if os.path.exists(target):
+                    target = self._unique_local_path(target)
+                if entry.is_dir:
+                    shutil.copytree(entry.backup, target)
+                else:
+                    shutil.copy2(entry.backup, target)
+                return True, f"Dipulihkan: {os.path.basename(target)}"
+            return False, f"Tidak ada cadangan: {os.path.basename(src)}"
+        return False, f"Operasi tidak diketahui: {op}"
+
+    def _reverse_android(self, entry: UndoEntry):
+        op = entry.op
+        src, dst = entry.source, entry.dest
+        try:
+            dev = entry.device_id or (self._get_device_id() or "" if self._get_device_id else "")
+            if op == "copy":
+                r = self._android_cmd("shell", f'rm -rf "{dst}"')
+                if r.returncode == 0:
+                    return True, f"Dihapus salinan di perangkat: {os.path.basename(dst)}"
+                return False, f"Gagal hapus salinan di perangkat: {(r.stderr or '').strip() or os.path.basename(dst)}"
+            if op in ("move", "rename"):
+                r = self._android_cmd("shell", f'mv "{dst}" "{src}"')
+                if r.returncode == 0:
+                    return True, f"Dikembalikan ke perangkat: {os.path.basename(src)}"
+                return False, f"Gagal kembalikan ke perangkat: {(r.stderr or '').strip() or os.path.basename(src)}"
+            if op == "delete":
+                if entry.backup and os.path.exists(entry.backup):
+                    if not dev:
+                        return False, "Tidak ada perangkat ADB untuk undo delete"
+                    dest = src
+                    note = ""
+                    # Folder '.trash-storage' dilindungi Android: user shell
+                    # hanya boleh menghapus, TIDAK boleh membuat file di
+                    # dalamnya (Operation not permitted). Jika sumber berada
+                    # di trash, pulihkan ke folder khusus di Download.
+                    in_trash = "/.trash-storage/" in src
+                    if in_trash:
+                        dest = self._android_restore_dest(dev, src)
+                        note = (" (dipulihkan ke Download/ADB File Manager Restore; "
+                                "folder asal di trash dilindungi Android)")
+                    # Push cadangan kembali ke perangkat. Jangan menambahkan
+                    # tanda kutip di sini: adb push memakai protokol sync,
+                    # bukan shell, sehingga spasi pada path aman.
+                    r = subprocess.run(
+                        ["adb", "-s", dev, "push", entry.backup, dest],
+                        capture_output=True, text=True, timeout=60)
+                    self._log(f"🔍 DEBUG adb push rc={r.returncode} "
+                              f"stdout={r.stdout[:120]} stderr={r.stderr[:120]}")
+                    if r.returncode != 0 and not in_trash:
+                        # Lokasi asal ternyata tidak bisa ditulis (mis. folder
+                        # sistem yang dilindungi); coba folder khusus Download.
+                        dest = self._android_restore_dest(dev, src)
+                        note = " (dipulihkan ke Download/ADB File Manager Restore; lokasi asal tidak bisa ditulis)"
+                        r = subprocess.run(
+                            ["adb", "-s", dev, "push", entry.backup, dest],
+                            capture_output=True, text=True, timeout=60)
+                        self._log(f"🔍 DEBUG adb push (fallback) rc={r.returncode} "
+                                  f"stdout={r.stdout[:120]} stderr={r.stderr[:120]}")
+                    if r.returncode == 0:
+                        try:
+                            os.remove(entry.backup)
+                        except Exception:
+                            pass
+                        return True, f"Dipulihkan ke perangkat: {dest}{note}"
+                    return False, f"Gagal push ke perangkat: {(r.stderr or '').strip() or os.path.basename(dest)}"
+                return False, f"Tidak ada cadangan: {os.path.basename(src)}"
+        except Exception as exc:
+            return False, str(exc)
+        return False, f"Operasi tidak diketahui: {op}"
+
+    def _android_restore_dest(self, dev, src):
+        """Tujuan pemulihan di folder khusus Download untuk file yang tak bisa
+        ditulis di lokasi aslinya. Buang awalan '.trashed-<timestamp>-' agar
+        nama file kembali wajar, lalu pastikan namanya unik."""
+        name = os.path.basename(src)
+        m = re.match(r"^\.trashed-\d+-(.+)$", name)
+        if m:
+            name = m.group(1)
+        subprocess.run(
+            ["adb", "-s", dev, "shell", "mkdir", "-p", f'"{ANDROID_RESTORE_DIR}"'],
+            capture_output=True, text=True, timeout=15)
+        return self._android_unique_path(dev, f"{ANDROID_RESTORE_DIR}/{name}")
+
+    def _android_exists(self, dev, path):
+        """Cek keberadaan path di perangkat tanpa menulis apa pun."""
+        try:
+            r = subprocess.run(
+                ["adb", "-s", dev, "shell", f'test -e "{path}"'],
+                capture_output=True, text=True, timeout=10)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _android_unique_path(self, dev, path):
+        """Kembalikan path unik di perangkat (tambah ' (n)' jika sudah ada)."""
+        if not self._android_exists(dev, path):
+            return path
+        directory, name = path.rsplit("/", 1)
+        root, ext = os.path.splitext(name)
+        i = 1
+        while True:
+            cand = f"{directory}/{root} ({i}){ext}"
+            if not self._android_exists(dev, cand):
+                return cand
+            i += 1
+
+    def _unique_local_path(self, path):
+        if not os.path.exists(path):
+            return path
+        root, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            cand = f"{root} ({i}){ext}"
+            if not os.path.exists(cand):
+                return cand
+            i += 1
 
 
 # ╔══════════════════════════════════════════════════════════════════════╗
@@ -891,6 +1187,14 @@ class ADBFileManagerApp:
         self._clipboard_source_panel: Optional[FilePanel] = None
         self._clipboard_source_dir: str = ""
 
+        # Undo stack & overwrite policy
+        self.undo = UndoManager(
+            log_fn=self._log,
+            run_adb_fn=self._run_adb,
+            get_device_id_fn=lambda: self.device_id,
+        )
+        self._overwrite_policy = None
+
         root.title("ADB File Manager")
         root.geometry("1440x780")
         root.minsize(920, 520)
@@ -899,6 +1203,60 @@ class ADBFileManagerApp:
         self._setup_style()
         self._build_ui()
         self._check_adb()
+
+        # Tangkap penutupan jendela untuk membersihkan cadangan undo
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Backup cleanup (undo cadangan) ────────────────────────────────
+
+    def _list_backup_files(self):
+        """Kembalikan daftar semua berkas cadangan undo di temp (rekursif, termasuk subfolder per device_id)."""
+        if not os.path.isdir(UNDO_DIR):
+            return []
+        result = []
+        try:
+            for root, _dirs, files in os.walk(UNDO_DIR):
+                for name in files:
+                    result.append(os.path.join(root, name))
+        except Exception:
+            pass
+        return result
+
+    def _has_pending_backups(self) -> bool:
+        return len(self._list_backup_files()) > 0
+
+    def _cleanup_backups(self):
+        """Hapus semua berkas cadangan undo di temp (dipakai saat keluar)."""
+        removed = 0
+        for path in self._list_backup_files():
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+        return removed
+
+    def _on_close(self):
+        """Handler penutupan jendela: peringatan jika ada cadangan, lalu bersihkan."""
+        if self._has_pending_backups():
+            files = self._list_backup_files()
+            daftar = "\n".join(os.path.basename(p) for p in files[:10])
+            if len(files) > 10:
+                daftar += f"\n... dan {len(files) - 10} berkas lainnya"
+            if not messagebox.askyesno(
+                    "Cadangan Undo Masih Ada",
+                    f"Terdapat {len(files)} berkas cadangan operasi hapus yang belum dibersihkan.\n\n"
+                    f"{daftar}\n\n"
+                    "Berkas ini diperlukan untuk mengembalikan file yang dihapus via Undo.\n"
+                    "Lanjutkan keluar dan hapus semua cadangan?",
+                    parent=self.root):
+                return  # Batal keluar
+
+        self._cleanup_backups()
+        self.root.destroy()
 
     # ── Style ─────────────────────────────────────────────────────────
 
@@ -927,6 +1285,8 @@ class ADBFileManagerApp:
     # ── Build UI ──────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self._build_menubar()
+
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -958,6 +1318,10 @@ class ADBFileManagerApp:
         self.pc._on_copy_cb  = self._clipboard_copy
         self.pc._on_cut_cb   = self._clipboard_cut
         self.pc._on_paste_cb = self._clipboard_paste
+
+        # Expose undo manager ke panel (digunakan oleh _delete_selected di panel)
+        self.android.undo = self.undo
+        self.pc.undo = self.undo
 
         # Wire drag & drop
         self.android._is_in_drop_target = \
@@ -1039,11 +1403,66 @@ class ADBFileManagerApp:
     def _build_log(self, parent):
         frm = ttk.Frame(parent)
         frm.pack(fill=tk.X, pady=3)
-        ttk.Label(frm, text="Log:", font=("Arial", 8)).pack(anchor=tk.W)
+        ttk.Label(frm, text="Log:  (klik-kanan di area log → salin semua ke clipboard)",
+                  font=("Arial", 8)).pack(anchor=tk.W)
         self.log_widget = scrolledtext.ScrolledText(
             frm, height=4, bg="#1a1a1a", fg="#00e676",
             font=("Consolas", 8))
         self.log_widget.pack(fill=tk.X)
+        # Klik-kanan di area log menyalin seluruh isi ke clipboard
+        self._log_text = self._bind_log_copy()
+
+    def _bind_log_copy(self):
+        """Temukan inner Text widget di dalam ScrolledText dan bind klik-kanan-untuk-copy."""
+        text_widget = None
+        for child in self.log_widget.winfo_children():
+            if isinstance(child, tk.Text):
+                text_widget = child
+                break
+        if text_widget:
+            text_widget.bind("<Button-3>", lambda _: self._copy_log_to_clipboard())
+        return text_widget
+
+    def _copy_log_to_clipboard(self):
+        """Salin seluruh isi log ke clipboard saat area log diklik-kanan."""
+        try:
+            content = self._log_text.get("1.0", tk.END) if self._log_text else ""
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+        except Exception:
+            pass
+
+    # ── Menu ──────────────────────────────────────────────────────────
+
+    def _build_menubar(self):
+        mbar = tk.Menu(self.root)
+        self.root.config(menu=mbar)
+
+        m_edit = tk.Menu(mbar, tearoff=0)
+        mbar.add_cascade(label="Edit", menu=m_edit)
+        m_edit.add_command(label="Undo", command=self._undo_action,
+                           accelerator="Ctrl+Z")
+        m_edit.add_separator()
+        m_edit.add_command(label="Bersihkan Riwayat Undo", command=self.undo.clear)
+
+        self.root.bind_all("<Control-z>", lambda _: self._undo_action())
+
+    def _undo_action(self):
+        if not self.undo.can_undo():
+            messagebox.showinfo(
+                "Undo", "Tidak ada operasi yang dapat dibatalkan.", parent=self.root)
+            return
+        desc = self.undo.last_description()
+        if not messagebox.askyesno(
+                "Undo", f"Batalkan operasi terakhir?\n{desc}", parent=self.root):
+            return
+        ok, msg = self.undo.undo()
+        if ok:
+            self._log(f"↩️ {msg}")
+            self.android.refresh()
+            self.pc.refresh()
+        else:
+            messagebox.showwarning("Undo", f"Undo gagal: {msg}", parent=self.root)
 
     # ── ADB ───────────────────────────────────────────────────────────
 
@@ -1106,6 +1525,127 @@ class ADBFileManagerApp:
         return subprocess.run(
             ["adb", "-s", self.device_id] + command,
             capture_output=True, text=True, timeout=timeout)
+
+    # ── Overwrite guard ───────────────────────────────────────────────
+
+    def _exists_pc(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def _exists_android(self, path: str) -> bool:
+        if not self.device_id:
+            return False
+        try:
+            r = self._run_adb(["shell", f'test -e "{path}"'], timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _unique_pc_path(self, path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        root, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            cand = f"{root} ({i}){ext}"
+            if not os.path.exists(cand):
+                return cand
+            i += 1
+
+    def _unique_android_path(self, path: str) -> str:
+        if not self._exists_android(path):
+            return path
+        root, ext = os.path.splitext(path)
+        i = 1
+        while True:
+            cand = f"{root} ({i}){ext}"
+            if not self._exists_android(cand):
+                return cand
+            i += 1
+
+    def _prompt_overwrite(self, dst: str, name: str) -> dict:
+        """Dialog overwrite modal (jalan di main thread). Blokir worker sampai jawab."""
+        box = {"action": "cancel", "new_path": None, "apply_all": False}
+        event = threading.Event()
+
+        def build():
+            dlg = tk.Toplevel(self.root)
+            dlg.title("File sudah ada")
+            dlg.transient(self.root)
+            dlg.grab_set()
+            dlg.resizable(False, False)
+
+            frm = ttk.Frame(dlg, padding=15)
+            frm.pack(fill=tk.BOTH, expand=True)
+
+            ttk.Label(frm,
+                      text=f"'{name}' sudah ada di tujuan.\nPilih tindakan:",
+                      justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
+
+            apply_var = tk.BooleanVar(value=False)
+
+            def set_res(action, new_path=None):
+                box["action"] = action
+                box["new_path"] = new_path
+                box["apply_all"] = apply_var.get()
+                event.set()
+                dlg.destroy()
+
+            btns = ttk.Frame(frm)
+            btns.pack(fill=tk.X, pady=(10, 0))
+            ttk.Button(btns, text="Lewati", width=12,
+                       command=lambda: set_res("skip")).pack(side=tk.LEFT, padx=3)
+            ttk.Button(btns, text="Timpa", width=12,
+                       command=lambda: set_res("overwrite")).pack(side=tk.LEFT, padx=3)
+            ttk.Button(btns, text="Ganti Nama", width=12,
+                       command=lambda: set_res("rename")).pack(side=tk.LEFT, padx=3)
+            ttk.Button(btns, text="Batal Semua", width=12,
+                       command=lambda: set_res("cancel")).pack(side=tk.LEFT, padx=3)
+
+            ttk.Checkbutton(frm, text="Terapkan ke semua file yang tersisa",
+                            variable=apply_var).pack(anchor=tk.W, pady=(8, 0))
+
+            dlg.protocol("WM_DELETE_WINDOW", lambda: set_res("cancel"))
+            dlg.wait_window()
+
+        self.root.after(0, build)
+        event.wait()
+        return box
+
+    def _resolve_dst(self, dst: str, name: str, is_android: bool):
+        """
+        Return (status, final_dst). status: 'proceed' | 'skip' | 'cancel'.
+        """
+        pol = getattr(self, "_overwrite_policy", None)
+        if pol == "skip_all":
+            return "skip", None
+        if pol == "overwrite_all":
+            return "proceed", dst
+        if pol == "rename_all":
+            return "proceed", (self._unique_android_path(dst) if is_android
+                               else self._unique_pc_path(dst))
+
+        exists = self._exists_android(dst) if is_android else self._exists_pc(dst)
+        if not exists:
+            return "proceed", dst
+
+        box = self._prompt_overwrite(dst, name)
+        action = box.get("action", "cancel")
+        if box.get("apply_all"):
+            self._overwrite_policy = {
+                "skip": "skip_all",
+                "overwrite": "overwrite_all",
+                "rename": "rename_all",
+            }.get(action)
+        if action == "cancel":
+            return "cancel", None
+        if action == "skip":
+            return "skip", None
+        if action == "overwrite":
+            return "proceed", dst
+        if action == "rename":
+            return "proceed", (self._unique_android_path(dst) if is_android
+                               else self._unique_pc_path(dst))
+        return "cancel", None
 
     # ── Helpers ───────────────────────────────────────────────────────
 
@@ -1227,16 +1767,30 @@ class ADBFileManagerApp:
                             # Jika copy di folder yang sama, buat nama unik
                             dp = f"{dst_base}/copy_{fi.name}"
 
+                    self._overwrite_policy = None
+                    status, resolved = self._resolve_dst(dp, fi.name, True)
+                    if status == "cancel":
+                        self._log("⚠️ Paste dibatalkan (batal timpa).")
+                        break
+                    if status == "skip":
+                        self._log(f"⏭ Dilewati (sudah ada): {fi.name}")
+                        continue
+                    dp = resolved
+
                     if action == "cut":
                         # Coba mv langsung, jika beda filesystem fallback ke cp + rm
                         cmd = f'if mv "{sp}" "{dp}" 2>/dev/null; then echo SUCCESS; elif cp -r "{sp}" "{dp}" 2>/dev/null && rm -rf "{sp}" 2>/dev/null; then echo SUCCESS; else echo FAIL; fi'
                         r = self._run_adb(["shell", cmd])
                         if "SUCCESS" in r.stdout:
                             self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                            self.undo.push(UndoEntry(op="move", source=sp, dest=dp,
+                                                     is_dir=fi.is_dir, android=True))
                         else:
                             r_err = self._run_adb(["shell", "mv", sp, dp])
                             if r_err.returncode == 0 and not r_err.stderr.strip():
                                 self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                                self.undo.push(UndoEntry(op="move", source=sp, dest=dp,
+                                                         is_dir=fi.is_dir, android=True))
                             else:
                                 self._log(f"❌ Cut error {fi.name}: {r_err.stderr or r.stdout or 'Gagal'}")
                     else:
@@ -1244,10 +1798,14 @@ class ADBFileManagerApp:
                         r = self._run_adb(["shell", cmd])
                         if "SUCCESS" in r.stdout:
                             self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                            self.undo.push(UndoEntry(op="copy", source=sp, dest=dp,
+                                                     is_dir=fi.is_dir, android=True))
                         else:
                             r_err = self._run_adb(["shell", "cp", "-r", sp, dp])
                             if r_err.returncode == 0 and not r_err.stderr.strip():
                                 self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                                self.undo.push(UndoEntry(op="copy", source=sp, dest=dp,
+                                                         is_dir=fi.is_dir, android=True))
                             else:
                                 self._log(f"❌ Copy error {fi.name}: {r_err.stderr or r.stdout or 'Gagal'}")
 
@@ -1272,16 +1830,34 @@ class ADBFileManagerApp:
                         else:
                             dp = os.path.join(dst_dir, f"copy_{fi.name}")
 
+                    self._overwrite_policy = None
+                    status, resolved = self._resolve_dst(dp, fi.name, False)
+                    if status == "cancel":
+                        self._log("⚠️ Paste dibatalkan (batal timpa).")
+                        break
+                    if status == "skip":
+                        self._log(f"⏭ Dilewati (sudah ada): {fi.name}")
+                        continue
+                    dp = resolved
+
                     try:
                         if action == "cut":
                             shutil.move(sp, dp)
                             self._log(f"✂️ Pindah: {fi.name} → {dst_dir}")
+                            self.undo.push(UndoEntry(op="move", source=sp, dest=dp,
+                                                     is_dir=fi.is_dir, android=False))
                         else:
                             if fi.is_dir:
-                                shutil.copytree(sp, dp, dirs_exist_ok=True)
+                                if os.path.exists(dp):
+                                    shutil.rmtree(dp)
+                                shutil.copytree(sp, dp)
                             else:
+                                if os.path.exists(dp):
+                                    os.remove(dp)
                                 shutil.copy2(sp, dp)
                             self._log(f"📋 Salin: {fi.name} → {dst_dir}")
+                            self.undo.push(UndoEntry(op="copy", source=sp, dest=dp,
+                                                     is_dir=fi.is_dir, android=False))
                     except Exception as exc:
                         self._log(f"❌ Paste error {fi.name}: {exc}")
 
@@ -1338,14 +1914,14 @@ class ADBFileManagerApp:
         pct_re = re.compile(r"\[\s*(\d+)%\]|(\d+)%")
         speed_re = re.compile(r"(\d+(?:\.\d+)?\s*(?:[KkMmGg]?[Bb]/s|[KkMmGg]B/s|[KkMmGg]b/s))")
 
-        def build_cmd(fi: FileItem) -> list:
+        def build_cmd(fi: FileItem, dst_path: str) -> list:
             if direction == "android_to_pc":
                 return ["adb", "-s", self.device_id, "pull",
                         f"{src_dir}/{fi.name}",
-                        os.path.join(dst_dir, fi.name)]
+                        dst_path]
             return ["adb", "-s", self.device_id, "push",
                     os.path.join(src_dir, fi.name),
-                    f"{dst_dir}/{fi.name}"]
+                    dst_path]
 
         def worker():
             self._cancel_requested = False
@@ -1363,14 +1939,29 @@ class ADBFileManagerApp:
 
                 bytes_transferred_prev = 0
 
+                self._overwrite_policy = None
+
                 for idx, fi in enumerate(items):
                     if self._cancel_requested:
                         self._log("⚠️ Transfer dibatalkan oleh pengguna.")
                         break
 
                     file_total_bytes = item_sizes[idx]
-                    dst_file_path = (os.path.join(dst_dir, fi.name)
-                                     if direction == "android_to_pc" else None)
+                    if direction == "android_to_pc":
+                        dst_full = os.path.join(dst_dir, fi.name)
+                    else:
+                        dst_full = f"{dst_dir.rstrip('/')}/{fi.name}"
+                    is_android_dst = (direction == "pc_to_android")
+
+                    status, resolved = self._resolve_dst(dst_full, fi.name, is_android_dst)
+                    if status == "cancel":
+                        self._log("⚠️ Transfer dibatalkan (batal timpa).")
+                        break
+                    if status == "skip":
+                        self._log(f"⏭ Dilewati (sudah ada): {fi.name}")
+                        continue
+                    dst_to_use = resolved
+                    dst_file_path = (dst_to_use if direction == "android_to_pc" else None)
 
                     # Initial progress status
                     base_pct = (bytes_transferred_prev / total_bytes_calc * 100
@@ -1388,7 +1979,7 @@ class ADBFileManagerApp:
                     if HAS_PTY and os.name != 'nt':
                         master_fd, slave_fd = pty.openpty()
                         proc = subprocess.Popen(
-                            build_cmd(fi),
+                            build_cmd(fi, dst_to_use),
                             stdin=subprocess.DEVNULL,
                             stdout=slave_fd,
                             stderr=slave_fd,
@@ -1398,7 +1989,7 @@ class ADBFileManagerApp:
                         out_stream = os.fdopen(master_fd, 'rb', buffering=0)
                     else:
                         proc = subprocess.Popen(
-                            build_cmd(fi),
+                            build_cmd(fi, dst_to_use),
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             bufsize=0
@@ -1521,6 +2112,17 @@ class ADBFileManagerApp:
                     bytes_transferred_prev += file_total_bytes
                     if proc.returncode == 0:
                         self._log(f"✅ Selesai: {fi.name} ({format_bytes(file_total_bytes)})")
+                        # Catat ke stack undo (hanya untuk salinan; cut lintas perangkat tidak dicatat)
+                        if not delete_source:
+                            self.undo.push(UndoEntry(
+                                op="copy",
+                                source=(f"{src_dir.rstrip('/')}/{fi.name}"
+                                        if direction == "android_to_pc"
+                                        else os.path.join(src_dir, fi.name)),
+                                dest=dst_to_use,
+                                is_dir=fi.is_dir,
+                                android=is_android_dst,
+                            ))
                         # Jika aksi adalah CUT, hapus file sumber setelah transfer sukses
                         if delete_source:
                             try:

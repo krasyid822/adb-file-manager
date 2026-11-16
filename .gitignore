@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Alat pengujian / cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Berkas OS/editor
+.DS_Store
+Thumbs.db
+*.swp
